@@ -1,10 +1,11 @@
 <img width="2172" height="724" alt="Breathless" src="https://github.com/user-attachments/assets/a4eb18dd-1eb3-44f9-8b15-a0c0ed738f0f" />
 
-<p align="center">
-  <img alt="Android 4.1+" src="https://img.shields.io/badge/Android-4.1%2B-3DDC84?logo=android&logoColor=white">
-  <img alt="ARMv7 32-bit" src="https://img.shields.io/badge/ARMv7-32--bit-0091BD">
-  <img alt="ARM64 64-bit" src="https://img.shields.io/badge/ARM64-64--bit-0091BD">
-</p>
+# Breathless Android
+
+![OS](https://img.shields.io/badge/up%20to-Android%2016-green)
+![Architecture](https://img.shields.io/badge/architecture-32/64bit-orange.svg)
+![Controller](https://img.shields.io/badge/Controls-Joypad)
+[![Support via PayPal](https://img.shields.io/badge/Support%20via-PayPal-0070BA?logo=paypal\&logoColor=white)](https://paypal.me/andiweli)
 
 ## About
 
