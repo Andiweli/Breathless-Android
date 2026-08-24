@@ -19,6 +19,10 @@ Download a provided APK or build one with Android Studio, then install it with A
 
 Requires Android 4.1 or newer and an ARMv7 or ARM64 device.
 
+## Planned
+
+- Touch input support
+
 ## Legal
 
 Breathless and its original game content are copyright their respective authors and rights holders, including Fields of Vision and Power Computing Ltd. This is an unofficial, non-commercial fan-made Android port and is not affiliated with or endorsed by the original rights holders.
