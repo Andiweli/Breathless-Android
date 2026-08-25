@@ -4,7 +4,7 @@
 
 ![OS](https://img.shields.io/badge/up%20to-Android%2016-green)
 ![Architecture](https://img.shields.io/badge/architecture-32/64bit-orange.svg)
-![Controller](https://img.shields.io/badge/Controls-Joypad)
+![Controller](https://img.shields.io/badge/Controls-Gamepad-blueviolet)
 [![Support via PayPal](https://img.shields.io/badge/Support%20via-PayPal-0070BA?logo=paypal\&logoColor=white)](https://paypal.me/andiweli)
 
 ## About
