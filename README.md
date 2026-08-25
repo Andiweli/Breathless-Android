@@ -17,7 +17,7 @@ This native Android port preserves the look, levels, gameplay and atmosphere of 
 
 ## Install Breathless on Android
 
-Download the appropriate APK for your platform or build one with Android Studio, then install it with Android's package installer. If required, allow installation from the app used to open the APK.
+[Download the appropriate APK](https://github.com/Andiweli/Breathless-Android/releases) for your platform or build one with Android Studio, then install it with Android's package installer. If required, allow installation from the app used to open the APK.
 
 ## Planned Features
 
