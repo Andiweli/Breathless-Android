@@ -1,3 +1,0 @@
-ninja: Entering directory `E:\Development\Android\Breathless\BreathlessAndroid\app\.cxx\cmake\debug\arm64-v8a'
-[1/2] Building CXX object CMakeFiles/breathless_native.dir/breathless_native.cpp.o
-[2/2] Linking CXX shared library E:\Development\Android\Breathless\BreathlessAndroid\app\build\intermediates\cmake\debug\obj\arm64-v8a\libbreathless_native.so

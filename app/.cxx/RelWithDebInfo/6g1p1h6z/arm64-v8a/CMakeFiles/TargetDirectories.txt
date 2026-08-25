@@ -1,3 +1,0 @@
-E:/Development/Android/Breathless/BreathlessAndroid/app/.cxx/RelWithDebInfo/6g1p1h6z/arm64-v8a/CMakeFiles/breathless_native.dir
-E:/Development/Android/Breathless/BreathlessAndroid/app/.cxx/RelWithDebInfo/6g1p1h6z/arm64-v8a/CMakeFiles/edit_cache.dir
-E:/Development/Android/Breathless/BreathlessAndroid/app/.cxx/RelWithDebInfo/6g1p1h6z/arm64-v8a/CMakeFiles/rebuild_cache.dir
