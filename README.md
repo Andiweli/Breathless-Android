@@ -2,7 +2,7 @@
 
 # Breathless for Android – Amiga FPS Port
 
-A native Android port of **Breathless**, the 1995 Commodore Amiga first-person shooter, for OUYA and Android Automotive devices.
+A native Android port of **Breathless**, the 1995 Commodore Amiga first-person shooter, for OUYA and Android devices with equipped Gamepad.
 
 ![OUYA](https://img.shields.io/badge/OUYA-Android%204.1%2B-green)
 ![Android Automotive](https://img.shields.io/badge/Android%20Automotive-Android%209%2B-green)
