@@ -10,8 +10,8 @@ android {
 
     defaultConfig {
         applicationId 'com.ast.breathlessamiga'
-        versionCode 26
-        versionName '0.7.5-dual-platform'
+        versionCode 37
+        versionName '1.0-dual-platform'
 
         externalNativeBuild {
             cmake {

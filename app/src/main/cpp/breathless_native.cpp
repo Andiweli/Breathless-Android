@@ -17,7 +17,13 @@
 #include <map>
 #include <set>
 
+// Keep the detailed reverse-engineering diagnostics in debug builds. Release
+// builds retain errors, but compile all informational/controller logs away.
+#ifdef NDEBUG
+#define LOGI(...) do { if (false) __android_log_print(ANDROID_LOG_INFO, "Breathless", __VA_ARGS__); } while (0)
+#else
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "Breathless", __VA_ARGS__)
+#endif
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "Breathless", __VA_ARGS__)
 
 static std::string gDataPath;
@@ -218,6 +224,13 @@ struct RuntimeImpactSpark {
     bool dead = false;
 };
 
+struct RuntimeImpactExplosion {
+    const GlobalObjectInfo* definition = nullptr;
+    float x = 0.0f, y = 0.0f, z = 0.0f; // z is the visual centre
+    float age = 0.0f;
+    bool dead = false;
+};
+
 struct LgldEdgeInfo {
     int normTex = 0;
     int upTex = 0;
@@ -352,11 +365,13 @@ enum FrontendState {
     FRONTEND_CREDITS,
     FRONTEND_LOADING,
     FRONTEND_GAME,
+    FRONTEND_MAP,
     FRONTEND_PAUSE,
     FRONTEND_TERMINAL
 };
 
 static void setFrontendState(FrontendState state);
+static void drawOriginalHud();
 static void selectLevelRelative(int direction, const char* source);
 static void applyGodModeLoadout();
 static void syncPlayerHeightFromCurrentCell(bool forceLog);
@@ -372,6 +387,15 @@ static int gSoundMenuSelection = 0;
 static int gControlsMenuSelection = 0;
 static int gControlCapture = -1;
 static int gPauseMenuSelection = 0;
+// Horizontal and vertical world sampling are selectable independently.
+// UI/HUD always remain pixel-exact.
+static int gRenderPixelSizeX = 1;
+static int gRenderPixelSizeY = 1;
+// Set by the Java launcher before game data/settings are loaded. This checks
+// the physical device identity, not the OUYA product flavor (which is also
+// used by modern handhelds such as Retroid).
+static bool gOuyaDevice = false;
+static unsigned int gLoadedControlVersion = 0u;
 static int gMusicVolume = 4;
 static int gSoundVolume = 5;
 static bool gMusicEnabled = true;
@@ -382,6 +406,7 @@ static int gActivateKey = 96;    // A
 static int gWeaponKey = 99;      // X
 static int gRunKey = 102;        // L1
 static int gMenuKey = 108;       // START
+static int gMapKey = 109;        // SELECT
 static bool gFireHeld = false;
 static bool gFireLatch = false;
 static bool gRunHeld = false;
@@ -470,6 +495,11 @@ static float gAnalogLX = 0.0f;
 static float gAnalogLY = 0.0f;
 static float gAnalogRX = 0.0f;
 static float gAnalogRY = 0.0f;
+static std::vector<unsigned char> gAutomapSeen(128u * 128u, 0u);
+static int gAutomapAssetIndex = -99999;
+static float gMapOriginX = 0.0f;
+static float gMapOriginY = 0.0f;
+static double gMapPanLastTime = 0.0;
 static float gPlayerX = 1.5f;
 static float gPlayerY = 1.5f;
 static float gPlayerA = 0.0f;
@@ -487,6 +517,12 @@ static float gPlayerBaseZF = 0.0f;
 static float gPlayerVerticalSpeed = 0.0f;
 static float gPlayerCameraEyeZF = (float)ORIG_PLAYER_EYES_HEIGHT;
 static float gPlayerCameraVerticalSpeed = 0.0f;
+// movement.asm stores the vertical view direction in CLookHeightNum.  The
+// original keys accelerate it to +/-4 units/tick and clamp the accumulated
+// look height to +/-72.  Android feeds the same axis from the right stick.
+static float gPlayerLookUnits = 0.0f;
+static float gPlayerLookSpeed = 0.0f;
+static int gPlayerLookHorizonY = VIEW_CENTER_Y;
 static float gPlayerBobPhase = 0.0f;
 static float gPlayerBobOffset = 0.0f;
 static bool gPlayerFalling = false;
@@ -509,6 +545,7 @@ static bool gCheckpointKeys[4] = {false,false,false,false};
 static std::vector<RuntimeObject> gRuntimeObjects;
 static std::vector<RuntimeProjectile> gRuntimeProjectiles;
 static std::vector<RuntimeImpactSpark> gRuntimeImpactSparks;
+static std::vector<RuntimeImpactExplosion> gRuntimeImpactExplosions;
 static double gObjectLastTime = 0.0;
 static double gPickupMessageUntil = 0.0;
 static std::string gPickupMessage;
@@ -524,13 +561,17 @@ static double gLevelExitStarted = 0.0;
 static double gLevelExitCompleteAfter = 1.15;
 static bool gTeleportActive = false;
 static double gTeleportStarted = 0.0;
-static double gTeleportCompleteAfter = 32.0 / 50.0;
+static double gTeleportCompleteAfter = 59.0 / 50.0;
+static bool gTeleportRelocated = false;
 static const int TELEPORT_SOUND_GROUP = 2;
 static const int ENEMY_HIT_SOUND_GROUP_BASE = 1000;
 // One-shot audio is produced by a separate Android thread. Keep transitions
 // alive for a few output buffers after the last decoded sample, rather than
 // tearing down the scene on the exact final-sample timestamp.
 static const double TELEPORT_AUDIO_TAIL_SECONDS = 0.12;
+static const double TELEPORT_WHITE_PEAK_SECONDS = 28.0 / 50.0;
+static const double TELEPORT_RELOCATE_SECONDS = 32.0 / 50.0;
+static const double TELEPORT_FADE_COMPLETE_SECONDS = 59.0 / 50.0;
 static int gRuntimeTerminalNumber = 0;
 static int gRuntimeTerminalPage = 0;
 static int gRuntimeTerminalSelection = 0;
@@ -2293,12 +2334,15 @@ static bool saveControlBindings() {
     std::vector<unsigned char> bytes;
     static const unsigned char magic[8] = {'B','L','C','T','R','L','0','1'};
     bytes.insert(bytes.end(), magic, magic + sizeof(magic));
-    appendSaveU32(bytes, 1u);
+    appendSaveU32(bytes, 5u);
     appendSaveU32(bytes, (unsigned int)gFireKey);
     appendSaveU32(bytes, (unsigned int)gActivateKey);
     appendSaveU32(bytes, (unsigned int)gWeaponKey);
     appendSaveU32(bytes, (unsigned int)gRunKey);
     appendSaveU32(bytes, (unsigned int)gMenuKey);
+    appendSaveU32(bytes, (unsigned int)gMapKey);
+    appendSaveU32(bytes, (unsigned int)gRenderPixelSizeX);
+    appendSaveU32(bytes, (unsigned int)gRenderPixelSizeY);
     appendSaveU32(bytes, fnv1aUpdate(2166136261u, &bytes[0], bytes.size()));
 
     const std::string temporaryPath = path + ".tmp";
@@ -2311,8 +2355,10 @@ static bool saveControlBindings() {
         LOGE("could not commit controller bindings");
         return false;
     }
-    LOGI("controller bindings saved fire=%d activate=%d weapon=%d run=%d menu=%d",
-         gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey);
+    LOGI("controller/video settings saved fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d",
+         gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey, gMapKey,
+         gRenderPixelSizeX, gRenderPixelSizeY);
+    gLoadedControlVersion = 5u;
     return true;
 }
 
@@ -2323,7 +2369,8 @@ static bool loadControlBindings() {
     if (!file) return false;
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
     const long length = ftell(file);
-    if (length != 36 || fseek(file, 0, SEEK_SET) != 0) { fclose(file); return false; }
+    if ((length != 36 && length != 40 && length != 44 && length != 48) ||
+        fseek(file, 0, SEEK_SET) != 0) { fclose(file); return false; }
     std::vector<unsigned char> bytes((size_t)length);
     const bool read = fread(&bytes[0], 1, bytes.size(), file) == bytes.size();
     fclose(file);
@@ -2334,7 +2381,12 @@ static bool loadControlBindings() {
     const unsigned int storedChecksum = readSaveU32(bytes, checksumOffset, ok);
     if (!ok || storedChecksum != fnv1aUpdate(2166136261u, &bytes[0], bytes.size() - 4u)) return false;
     size_t offset = 8u;
-    if (readSaveU32(bytes, offset, ok) != 1u) return false;
+    const unsigned int version = readSaveU32(bytes, offset, ok);
+    if (!ok || (version != 1u && version != 2u && version != 3u &&
+                version != 4u && version != 5u)) return false;
+    if ((version == 1u && length != 36) || (version == 2u && length != 40) ||
+        (version == 3u && length != 44) ||
+        ((version == 4u || version == 5u) && length != 48)) return false;
     const int bindings[5] = {
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
@@ -2346,8 +2398,27 @@ static bool loadControlBindings() {
     gWeaponKey = bindings[2];
     gRunKey = bindings[3];
     gMenuKey = bindings[4];
-    LOGI("controller bindings loaded fire=%d activate=%d weapon=%d run=%d menu=%d",
-         gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey);
+    if (version >= 2u) {
+        const int mapBinding = (int)readSaveU32(bytes, offset, ok);
+        if (!ok || !validControllerBinding(mapBinding)) return false;
+        gMapKey = mapBinding;
+    }
+    if (version == 3u) {
+        const int renderSize = (int)readSaveU32(bytes, offset, ok);
+        if (!ok || (renderSize != 1 && renderSize != 2)) return false;
+        gRenderPixelSizeX = gRenderPixelSizeY = renderSize;
+    } else if (version >= 4u) {
+        const int renderSizeX = (int)readSaveU32(bytes, offset, ok);
+        const int renderSizeY = (int)readSaveU32(bytes, offset, ok);
+        if (!ok || (renderSizeX != 1 && renderSizeX != 2) ||
+            (renderSizeY != 1 && renderSizeY != 2)) return false;
+        gRenderPixelSizeX = renderSizeX;
+        gRenderPixelSizeY = renderSizeY;
+    }
+    LOGI("controller/video settings loaded fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d version=%u",
+         gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey, gMapKey,
+         gRenderPixelSizeX, gRenderPixelSizeY, version);
+    gLoadedControlVersion = version;
     return true;
 }
 
@@ -2767,6 +2838,7 @@ static bool loadGameProgress() {
         gActivatedSwitchParts.swap(savedSwitchParts);
         gRuntimeProjectiles.clear();
         gRuntimeImpactSparks.clear();
+        gRuntimeImpactExplosions.clear();
         gObjectLastTime = nowSeconds();
         gMoveLastTime = nowSeconds();
     } else {
@@ -2824,6 +2896,7 @@ static void resetSavedGame() {
     gRuntimeObjects.clear();
     gRuntimeProjectiles.clear();
     gRuntimeImpactSparks.clear();
+    gRuntimeImpactExplosions.clear();
     gActiveEffects.clear();
     gPermanentEffectLists.clear();
     gActiveEnemyTriggers.clear();
@@ -2878,8 +2951,21 @@ static void scanGameData() {
     gPlayerProgressValid = false;
     gRestoreLevelCheckpoint = false;
     loadGameProgress();
+    gLoadedControlVersion = 0u;
     const bool controlsLoaded = loadControlBindings();
-    LOGI("Breathless Android 0.7.5 dataPath=%s gldFiles=%d first=%s probe=%s save=%s controls=%s", gDataPath.c_str(), gGldFiles, gFirstGldName.c_str(), gFirstGldProbeOk ? "OK" : "MISS", gPlayerProgressValid ? "loaded" : "new", controlsLoaded ? "loaded" : "defaults");
+    // Format v5 records that the OUYA default has already been considered.
+    // New installations and older settings migrate once to 2x2; afterwards a
+    // deliberate in-game choice (including 1x1) is preserved on every start.
+    if (gOuyaDevice && gLoadedControlVersion < 5u) {
+        gRenderPixelSizeX = 2;
+        gRenderPixelSizeY = 2;
+        if (saveControlBindings()) {
+            LOGI("OUYA hardware detected: initial render size set to 2x2");
+        } else {
+            LOGE("OUYA hardware detected: could not persist initial 2x2 render size");
+        }
+    }
+    LOGI("Breathless Android 1.0 dataPath=%s gldFiles=%d first=%s probe=%s save=%s controls=%s ouya=%s", gDataPath.c_str(), gGldFiles, gFirstGldName.c_str(), gFirstGldProbeOk ? "OK" : "MISS", gPlayerProgressValid ? "loaded" : "new", controlsLoaded ? "loaded" : "defaults", gOuyaDevice ? "yes" : "no");
 }
 
 static void ensureGl() {
@@ -2927,10 +3013,13 @@ static void ensureRuntimeLevelState() {
         gActiveEffects.clear();
         gRuntimeProjectiles.clear();
         gRuntimeImpactSparks.clear();
+        gRuntimeImpactExplosions.clear();
         return;
     }
     if (gRuntimeAssetIndex == gAssetIndex && gRuntimeBlocks.size() == ai->lgldBlockData.size()) return;
     gRuntimeAssetIndex = gAssetIndex;
+    std::fill(gAutomapSeen.begin(), gAutomapSeen.end(), 0u);
+    gAutomapAssetIndex = gAssetIndex;
     gRuntimeBlocks = ai->lgldBlockData;
     gInitialRuntimeBlocks = ai->lgldBlockData;
     gActiveEffects.clear();
@@ -2970,10 +3059,15 @@ static void ensureRuntimeLevelState() {
     gLevelExitCompleteAfter = 1.15;
     gTeleportActive = false;
     gTeleportStarted = 0.0;
-    gTeleportCompleteAfter = 32.0 / 50.0;
+    gTeleportCompleteAfter = TELEPORT_FADE_COMPLETE_SECONDS;
+    gTeleportRelocated = false;
+    gPlayerLookUnits = 0.0f;
+    gPlayerLookSpeed = 0.0f;
+    gPlayerLookHorizonY = VIEW_CENTER_Y;
     gRuntimeObjects.clear();
     gRuntimeProjectiles.clear();
     gRuntimeImpactSparks.clear();
+    gRuntimeImpactExplosions.clear();
     gRuntimeObjects.reserve(ai->lgldPlacedObjects.size());
     for (size_t i = 0; i < ai->lgldPlacedObjects.size(); ++i) {
         const LgldPlacedObject& placed = ai->lgldPlacedObjects[i];
@@ -3038,6 +3132,57 @@ static const LgldBlockInfo* currentLgldBlockForCell(int mx, int my) {
     if (v < 0) v = -v;
     if (v <= 0 || v >= (int)ai->lgldBlockData.size()) return nullptr;
     return currentLgldBlockByIndex(v);
+}
+
+static void markAutomapCell(int mx, int my) {
+    if (mx < 0 || my < 0 || mx >= 128 || my >= 128) return;
+    gAutomapSeen[(size_t)my * 128u + (size_t)mx] = 1u;
+}
+
+static bool automapCellSeen(int mx, int my) {
+    if (mx < 0 || my < 0 || mx >= 128 || my >= 128) return false;
+    if (gAutomapSeen[(size_t)my * 128u + (size_t)mx] != 0u) return true;
+    // Map.asm closes isolated one-cell gaps when both horizontal or both
+    // vertical neighbours have already been discovered.
+    const bool horizontal = mx > 0 && mx < 127 &&
+        gAutomapSeen[(size_t)my * 128u + (size_t)(mx - 1)] != 0u &&
+        gAutomapSeen[(size_t)my * 128u + (size_t)(mx + 1)] != 0u;
+    const bool vertical = my > 0 && my < 127 &&
+        gAutomapSeen[(size_t)(my - 1) * 128u + (size_t)mx] != 0u &&
+        gAutomapSeen[(size_t)(my + 1) * 128u + (size_t)mx] != 0u;
+    return horizontal || vertical;
+}
+
+static void updateAutomapDiscovery() {
+    if (gAutomapAssetIndex != gAssetIndex) {
+        std::fill(gAutomapSeen.begin(), gAutomapSeen.end(), 0u);
+        gAutomapAssetIndex = gAssetIndex;
+    }
+    const float directionX = cosf(gPlayerA);
+    const float directionY = sinf(gPlayerA);
+    const bool xDominant = fabsf(directionX) >= fabsf(directionY);
+    for (int ray = -1; ray <= 1; ++ray) {
+        // The original rays are parallel and begin one map block apart on the
+        // non-dominant axis, rather than spreading out like a view cone.
+        float x = gPlayerX + (xDominant ? 0.0f : (float)ray);
+        float y = gPlayerY + (xDominant ? (float)ray : 0.0f);
+        int previousX = -99999, previousY = -99999;
+        for (int step = 0; step < 2048; ++step) {
+            const int mx = (int)floorf(x);
+            const int my = (int)floorf(y);
+            if (mx < 0 || my < 0 || mx >= 128 || my >= 128) break;
+            if (mx != previousX || my != previousY) {
+                markAutomapCell(mx, my);
+                previousX = mx;
+                previousY = my;
+                const short raw = currentLgldCellRaw(mx, my);
+                const LgldBlockInfo* block = currentLgldBlockForCell(mx, my);
+                if (raw <= 0 || (block && block->floorHeight == block->ceilHeight)) break;
+            }
+            x += directionX * 0.125f;
+            y += directionY * 0.125f;
+        }
+    }
 }
 
 static const GlobalObjectInfo* objectDefinition(const std::string& name) {
@@ -3179,10 +3324,12 @@ static void spawnProjectile(const GlobalObjectInfo* definition, float x, float y
     projectile.definition = definition;
     projectile.dirX = dx / planarDistance;
     projectile.dirY = dy / planarDistance;
-    // This port has no vertical-look control. Keep all shots on their muzzle
-    // plane so player and enemy projectiles remain visibly horizontal.
-    (void)targetZ;
-    projectile.verticalSlope = 0.0f;
+    // Objects.asm stores obj_hheading as a fixed-point vertical slope. Enemy
+    // shots derive it from the height difference to PlayerY; PlayerShot copies
+    // the current LookHeightNum.  Our horizontal coordinates are map cells
+    // while z remains in original world units, so keep the equivalent
+    // world-units-per-cell slope explicitly.
+    projectile.verticalSlope = (targetZ - z) / planarDistance;
     projectile.x = x + projectile.dirX * 0.25f;
     projectile.y = y + projectile.dirY * 0.25f;
     projectile.z = z;
@@ -3204,6 +3351,47 @@ static const GlobalObjectInfo* explosionDefinitionForCode(int code) {
         if (it->second.objectType == 5u && it->second.param[0] == code) return &it->second;
     }
     return nullptr;
+}
+
+static void spawnProjectileImpactExplosion(const RuntimeProjectile& projectile,
+                                            float impactX, float impactY, float impactZ,
+                                            float normalX, float normalY, float normalZ) {
+    if (!projectile.definition) return;
+    // Objects.asm/MSstop reads o_param9 from the shot and replaces that shot
+    // with ExplObj1[param9]. Weapons 3 and 6 point at the same definition in
+    // the original data, so keep this data-driven rather than weapon-number
+    // specific.
+    const int explosionCode = projectile.definition->param[8];
+    if (explosionCode < 0) return;
+    const GlobalObjectInfo* explosion = explosionDefinitionForCode(explosionCode);
+    if (!explosion || explosion->frames.empty()) return;
+
+    RuntimeImpactExplosion effect;
+    effect.definition = explosion;
+    effect.x = impactX;
+    effect.y = impactY;
+    effect.z = impactZ;
+    // Pull the centre half a sprite away from a solid surface so the original
+    // opaque explosion frames are not depth-clipped into the wall/plane.
+    const float radius = (float)std::max(2, explosion->height) * 0.5f;
+    effect.x += normalX * 0.018f;
+    effect.y += normalY * 0.018f;
+    effect.z += normalZ * radius;
+    gRuntimeImpactExplosions.push_back(effect);
+    if (!explosion->sound[0].empty())
+        playSoundResource(explosion->sound[0], 0.0f, 0, false, true);
+}
+
+static void updateRuntimeImpactExplosions(float dt) {
+    for (size_t i = 0; i < gRuntimeImpactExplosions.size(); ++i) {
+        RuntimeImpactExplosion& effect = gRuntimeImpactExplosions[i];
+        if (effect.dead || !effect.definition) continue;
+        effect.age += dt;
+        if ((int)(effect.age / 0.08f) >= (int)effect.definition->frames.size()) effect.dead = true;
+    }
+    gRuntimeImpactExplosions.erase(std::remove_if(gRuntimeImpactExplosions.begin(),
+        gRuntimeImpactExplosions.end(), [](const RuntimeImpactExplosion& effect) { return effect.dead; }),
+        gRuntimeImpactExplosions.end());
 }
 
 static bool hasEnemyFallingAnimation(const GlobalObjectInfo& definition) {
@@ -3410,6 +3598,9 @@ static void updateRuntimeProjectiles(float dt) {
                 spawnProjectileImpactSparks(projectile, boundaryX, impactY,
                     impactZ + (float)std::max(1, projectile.definition->height) * 0.5f,
                     normalX, 0.0f, 0.0f);
+                spawnProjectileImpactExplosion(projectile, boundaryX, impactY,
+                    impactZ + (float)std::max(1, projectile.definition->height) * 0.5f,
+                    normalX, 0.0f, 0.0f);
                 projectile.dead = true;
                 break;
             }
@@ -3425,6 +3616,9 @@ static void updateRuntimeProjectiles(float dt) {
                 spawnProjectileImpactSparks(projectile, impactX, boundaryY,
                     impactZ + (float)std::max(1, projectile.definition->height) * 0.5f,
                     0.0f, normalY, 0.0f);
+                spawnProjectileImpactExplosion(projectile, impactX, boundaryY,
+                    impactZ + (float)std::max(1, projectile.definition->height) * 0.5f,
+                    0.0f, normalY, 0.0f);
                 projectile.dead = true;
                 break;
             }
@@ -3435,9 +3629,22 @@ static void updateRuntimeProjectiles(float dt) {
             // true penetration; otherwise floor-level effects vanish instantly.
             if (!block || nextZ < (float)block->floorHeight ||
                 nextZ + projectileHeight > (float)block->ceilHeight) {
-                spawnProjectileImpactSparks(projectile, projectile.x, projectile.y,
-                    projectile.z + (float)projectileHeight * 0.5f,
-                    -projectile.dirX, -projectile.dirY, 0.0f);
+                float impactX = nextX, impactY = nextY;
+                float impactZ = nextZ + (float)projectileHeight * 0.5f;
+                float normalX = -projectile.dirX, normalY = -projectile.dirY, normalZ = 0.0f;
+                if (block && nextZ < (float)block->floorHeight) {
+                    impactZ = (float)block->floorHeight;
+                    normalX = normalY = 0.0f;
+                    normalZ = 1.0f;
+                } else if (block) {
+                    impactZ = (float)block->ceilHeight;
+                    normalX = normalY = 0.0f;
+                    normalZ = -1.0f;
+                }
+                spawnProjectileImpactSparks(projectile, impactX, impactY, impactZ,
+                    normalX, normalY, normalZ);
+                spawnProjectileImpactExplosion(projectile, impactX, impactY, impactZ,
+                    normalX, normalY, normalZ);
                 projectile.dead = true;
                 break;
             }
@@ -3449,6 +3656,8 @@ static void updateRuntimeProjectiles(float dt) {
             previousCellX = nextCellX;
             previousCellY = nextCellY;
             if (projectile.travelled >= projectile.maxDistance) {
+                spawnProjectileImpactExplosion(projectile, projectile.x, projectile.y,
+                    projectile.z + (float)projectileHeight * 0.5f, 0.0f, 0.0f, 0.0f);
                 projectile.dead = true;
                 break;
             }
@@ -3650,6 +3859,7 @@ static void updateRuntimeObjects() {
     dt = std::max(0.0f, std::min(0.08f, dt));
     updateRuntimeProjectiles(dt);
     updateRuntimeImpactSparks(dt);
+    updateRuntimeImpactExplosions(dt);
     for (size_t i = 0; i < gRuntimeObjects.size(); ++i) {
         RuntimeObject& runtime = gRuntimeObjects[i];
         if (runtime.collected || runtime.dead || runtime.placedIndex >= ai->lgldPlacedObjects.size()) continue;
@@ -3707,8 +3917,13 @@ static void updateRuntimeObjects() {
             const float floor = enemyBlock ? (float)enemyBlock->floorHeight : 0.0f;
             const float pan = std::max(-1.0f, std::min(1.0f, (runtime.x - gPlayerX) / 6.0f));
             if (!gPlayerDead && shot && clearObjectLine(runtime.x, runtime.y, gPlayerX, gPlayerY)) {
+                // EnemiesFire subtracts PLAYER_EYES_HEIGHT from PlayerY before
+                // calculating obj_hheading, so enemies aim at the player's
+                // current base (including the sampled walking displacement).
                 spawnProjectile(shot, runtime.x, runtime.y, floor + definition->param[11],
-                                gPlayerX, gPlayerY, gPlayerBaseZF + ORIG_PLAYER_EYES_HEIGHT, true, 1);
+                                gPlayerX, gPlayerY,
+                                (float)gPlayerEyeZ - (float)ORIG_PLAYER_EYES_HEIGHT,
+                                true, 1);
                 playSoundResource(shot->sound[0], pan);
             } else if (!gPlayerDead && !shot && distance < 0.65f &&
                        clearObjectLine(runtime.x, runtime.y, gPlayerX, gPlayerY)) {
@@ -3810,9 +4025,15 @@ static void playerFireWeapon() {
     const int shots = gPlayerWeapons[gPlayerWeapon] >= 2 ? 2 : 1;
     for (int shotIndex = 0; shotIndex < shots; ++shotIndex) {
         const float angle = gPlayerA + (shots == 2 ? (shotIndex == 0 ? -0.025f : 0.025f) : 0.0f);
-        spawnProjectile(weapon, gPlayerX, gPlayerY, gPlayerBaseZF + weapon->param[11],
+        const float muzzleZ = gPlayerBaseZF + weapon->param[11];
+        // PlayerShot uses (LookHeightNum << 8) as obj_hheading. Projectile
+        // movement then applies heading/32768 per original world unit. Since
+        // one map cell is 64 world units, this is LookHeightNum/2 z-units per
+        // cell and intersects the fixed centre sight exactly.
+        const float verticalSlope = gPlayerLookUnits * 0.5f;
+        spawnProjectile(weapon, gPlayerX, gPlayerY, muzzleZ,
                         gPlayerX + cosf(angle) * 20.0f, gPlayerY + sinf(angle) * 20.0f,
-                        gPlayerBaseZF + weapon->param[11], false, 1);
+                        muzzleZ + verticalSlope * 20.0f, false, 1);
     }
 }
 
@@ -3900,10 +4121,13 @@ static void beginTeleportTransition() {
     stopSoundGroup(1);
     const double soundDuration = playTeleportSound();
     gTeleportActive = true;
+    gTeleportRelocated = false;
     gTeleportStarted = nowSeconds();
-    // Animations.asm waits 32 ticks. Also honor a longer decoded sample so
-    // asynchronous Android audio can always finish before the transition.
-    gTeleportCompleteAfter = std::max(32.0 / 50.0,
+    // TMapMain Fade starts the white/fog return at tick 28 and completes at
+    // tick 59. Animations.asm relocates at tick 32, just after the white peak.
+    // Also keep the transition locked for a longer decoded sample so Android's
+    // asynchronous audio thread can play the complete teleport sound.
+    gTeleportCompleteAfter = std::max(TELEPORT_FADE_COMPLETE_SECONDS,
         soundDuration + TELEPORT_AUDIO_TAIL_SECONDS);
     gAnalogLX = gAnalogLY = gAnalogRX = gAnalogRY = 0.0f;
     gFireHeld = gFireLatch = false;
@@ -3955,12 +4179,18 @@ static void updateRuntimeEffects(float dt) {
                 beginTeleportTransition();
                 e.phase = 1;
             }
-            if (nowSeconds() - gTeleportStarted >= gTeleportCompleteAfter) {
+            const double teleportElapsed = nowSeconds() - gTeleportStarted;
+            if (!gTeleportRelocated && teleportElapsed >= TELEPORT_RELOCATE_SECONDS) {
                 gPlayerX = (float)e.command.param1 + 0.5f;
                 gPlayerY = (float)e.command.param2 + 0.5f;
                 gPlayerStartChecked = false;
                 syncPlayerHeightFromCurrentCell(true);
+                gTeleportRelocated = true;
+                e.phase = 2;
+            }
+            if (teleportElapsed >= gTeleportCompleteAfter) {
                 gTeleportActive = false;
+                gTeleportRelocated = false;
                 gTeleportStarted = 0.0;
                 e.finished = true;
             }
@@ -4520,7 +4750,12 @@ static void updatePlayerMotion() {
     if (gMoveLastTime <= 0.0) { gMoveLastTime = t; return; }
     double dt = t - gMoveLastTime; gMoveLastTime = t;
     if (dt < 0.0) dt = 0.0;
-    if (dt > 0.05) dt = 0.05;
+    // The original game advances movement from a 50 Hz timer. The former
+    // 50 ms cap discarded real elapsed time whenever a slower device rendered
+    // below 20 FPS, making OUYA movement slower despite otherwise smooth input.
+    // A 200 ms safety cap prevents resume/stall jumps while preserving the
+    // same cells-per-second speed across OUYA, Retroid and Automotive.
+    if (dt > 0.20) dt = 0.20;
     if (gFireReleaseDeadline > 0.0 && t >= gFireReleaseDeadline) {
         gFireHeld = false;
         gFireLatch = false;
@@ -4542,11 +4777,34 @@ static void updatePlayerMotion() {
     const int oldFloor = currentPlayerFloorHeight();
     float turn = gPlayerDead ? 0.0f : gAnalogRX; if (fabsf(turn) < 0.10f) turn = 0.0f;
     gPlayerA += turn * 2.35f * (float)dt;
+    float lookInput = gPlayerDead ? 0.0f : -gAnalogRY;
+    if (fabsf(lookInput) < 0.12f) lookInput = 0.0f;
+    // movement.asm: target speed lookupdown*4 units/tick, acceleration one
+    // unit/tick and accumulated CLookHeightNum clamped to +/-72. Expressed in
+    // real time this is 200 units/s with 2500 units/s^2 acceleration.
+    const float wantedLookSpeed = lookInput * 200.0f;
+    const float lookAcceleration = 2500.0f * (float)dt;
+    if (gPlayerLookSpeed < wantedLookSpeed)
+        gPlayerLookSpeed = std::min(wantedLookSpeed, gPlayerLookSpeed + lookAcceleration);
+    else if (gPlayerLookSpeed > wantedLookSpeed)
+        gPlayerLookSpeed = std::max(wantedLookSpeed, gPlayerLookSpeed - lookAcceleration);
+    gPlayerLookUnits = std::max(-72.0f, std::min(72.0f,
+        gPlayerLookUnits + gPlayerLookSpeed * (float)dt));
+    if ((gPlayerLookUnits <= -72.0f && gPlayerLookSpeed < 0.0f) ||
+        (gPlayerLookUnits >= 72.0f && gPlayerLookSpeed > 0.0f)) gPlayerLookSpeed = 0.0f;
+    const float projectedLookOffset = gPlayerLookUnits * 0.5f *
+        ((float)FB_H / ORIGINAL_VERTICAL_REFERENCE);
+    const int roundedLookOffset = (int)(projectedLookOffset +
+        (projectedLookOffset >= 0.0f ? 0.5f : -0.5f));
+    gPlayerLookHorizonY = std::max(8, std::min(VIEW_H - 8,
+        VIEW_CENTER_Y + roundedLookOffset));
     float fwd = gPlayerDead ? 0.0f : -gAnalogLY;
     float str = gPlayerDead ? 0.0f : gAnalogLX;
     if (fabsf(fwd) < 0.12f) fwd = 0.0f;
     if (fabsf(str) < 0.12f) str = 0.0f;
-    const float movementAmount = std::min(1.0f, sqrtf(fwd * fwd + str * str));
+    const float inputLength = sqrtf(fwd * fwd + str * str);
+    const float movementAmount = std::min(1.0f, inputLength);
+    const float runScale = gRunHeld ? 1.5f : 1.0f;
     if (!gPlayerDead && !gPlayerFalling && movementAmount > 0.0f) {
         static const signed char bobWave[64] = {
              0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 7,
@@ -4556,8 +4814,28 @@ static void updatePlayerMotion() {
         };
         // OscSpeedTrans[64] is 40 in movement.asm; OscCont is sampled after
         // shifting four bits, so normal walking advances 125 wave samples/s.
-        const float phaseStepsPerSecond = 125.0f * movementAmount;
-        gPlayerBobPhase = fmodf(gPlayerBobPhase + phaseStepsPerSecond * (float)dt, 64.0f);
+        const float previousPhase = gPlayerBobPhase;
+        const bool walkingBackward = fwd < -0.01f;
+        const float phaseDirection = walkingBackward ? -1.0f : 1.0f;
+        const float phaseStepsPerSecond = 125.0f * movementAmount * runScale;
+        gPlayerBobPhase = fmodf(previousPhase +
+            phaseDirection * phaseStepsPerSecond * (float)dt, 64.0f);
+        if (gPlayerBobPhase < 0.0f) gPlayerBobPhase += 64.0f;
+
+        // movement.asm plays GlobalSound5 once per walking waveform. Forward
+        // movement enters the original >=50 gate; backward movement decrements
+        // the phase and enters its <=46 gate. Crossing tests also handle wrap.
+        bool footstep = false;
+        if (!walkingBackward) {
+            footstep = gPlayerBobPhase >= previousPhase
+                ? (previousPhase < 50.0f && gPlayerBobPhase >= 50.0f)
+                : (previousPhase < 50.0f || gPlayerBobPhase >= 50.0f);
+        } else {
+            footstep = gPlayerBobPhase <= previousPhase
+                ? (previousPhase > 46.0f && gPlayerBobPhase <= 46.0f)
+                : (previousPhase > 46.0f || gPlayerBobPhase <= 46.0f);
+        }
+        if (footstep) playGlobalSoundCode(5);
         // OscillationAmp's speed-64 row maps the seven-pixel source wave to
         // five vertical pixels at normal walking speed.
         gPlayerBobOffset = (float)bobWave[(int)gPlayerBobPhase & 63] * (5.0f / 7.0f) * movementAmount;
@@ -4566,9 +4844,18 @@ static void updatePlayerMotion() {
         gPlayerBobOffset = 0.0f;
     }
     const float ca = cosf(gPlayerA), sa = sinf(gPlayerA);
-    const float runScale = gRunHeld ? 1.5f : 1.0f;
-    float nx = gPlayerX + (ca * fwd * 1.95f + -sa * str * 1.35f) * runScale * (float)dt;
-    float ny = gPlayerY + (sa * fwd * 1.95f +  ca * str * 1.35f) * runScale * (float)dt;
+    float moveForward = 0.0f, moveSide = 0.0f;
+    if (inputLength > 0.0001f) {
+        const float directionScale = movementAmount / inputLength;
+        moveForward = fwd * directionScale;
+        moveSide = str * directionScale;
+    }
+    // movement.asm uses the same PlayerWalkSpeed/PlayerRunSpeed for forward,
+    // backward, sideways and diagonal directions; movingdirtable only rotates
+    // the movement vector. Keep the total speed constant for diagonal input.
+    const float originalMovementSpeed = 1.95f;
+    float nx = gPlayerX + (ca * moveForward - sa * moveSide) * originalMovementSpeed * runScale * (float)dt;
+    float ny = gPlayerY + (sa * moveForward + ca * moveSide) * originalMovementSpeed * runScale * (float)dt;
 
     // v63: height-aware movement plus visible drop diagnostics. Positive LGLD cells are no
     // longer enough; the target floor must be climbable, very deep blind
@@ -4990,25 +5277,99 @@ static void updateOriginalVTableProbe() {
     }
 }
 
+static int currentViewHorizonY() {
+    // With obj_hheading, LookHeightNum/2 is the vertical rise per map cell.
+    // Shift the rendered horizon by the matching projected amount so a player
+    // shot always travels through the original fixed hardware-sprite sight.
+    return gPlayerLookHorizonY;
+}
+
+static unsigned int sampleSkyMedianColumn(const TextureBitmap& texture, int x, int y) {
+    struct SkySample { unsigned int color; unsigned int brightness; } samples[5];
+    for (int sample = 0; sample < 5; ++sample) {
+        const unsigned int color = paletteColor(sampleTextureBitmap(texture, x + sample - 2, y));
+        const unsigned int red = color & 0xffu;
+        const unsigned int green = (color >> 8) & 0xffu;
+        const unsigned int blue = (color >> 16) & 0xffu;
+        samples[sample].color = color;
+        samples[sample].brightness = red * 77u + green * 150u + blue * 29u;
+    }
+    // Five-element insertion sort is cheaper here than widening/blurring the
+    // complete panorama. Returning the middle real palette colour removes a
+    // two-column dark impulse without inventing colours at cloud edges.
+    for (int current = 1; current < 5; ++current) {
+        const SkySample value = samples[current];
+        int position = current;
+        while (position > 0 && samples[position - 1].brightness > value.brightness) {
+            samples[position] = samples[position - 1];
+            --position;
+        }
+        samples[position] = value;
+    }
+    return samples[2].color;
+}
+
+static unsigned int sampleSkyColorFiltered(const TextureBitmap& texture, float x, int y) {
+    if (!texture.ok || texture.width == 0u) return 0xff000000u;
+    const float wrapped = x - floorf(x / (float)texture.width) * (float)texture.width;
+    const int x0 = (int)floorf(wrapped);
+    const int x1 = (x0 + 1) % (int)texture.width;
+    const float blend = wrapped - (float)x0;
+    // The marked bands are isolated source columns. The previous weighted
+    // filter spread each one over several Android columns. A 5-column median
+    // removes the final two-column impulse first; interpolation then scales
+    // the cleaned sky without softening the broad cloud formations.
+    const unsigned int first = sampleSkyMedianColumn(texture, x0, y);
+    const unsigned int second = sampleSkyMedianColumn(texture, x1, y);
+    const unsigned int red = (unsigned int)((float)(first & 0xffu) * (1.0f - blend) +
+        (float)(second & 0xffu) * blend + 0.5f);
+    const unsigned int green = (unsigned int)((float)((first >> 8) & 0xffu) * (1.0f - blend) +
+        (float)((second >> 8) & 0xffu) * blend + 0.5f);
+    const unsigned int blue = (unsigned int)((float)((first >> 16) & 0xffu) * (1.0f - blend) +
+        (float)((second >> 16) & 0xffu) * blend + 0.5f);
+    return 0xff000000u | (blue << 16) | (green << 8) | red;
+}
+
 static void drawSkyBackground() {
     // v33: Breathless outdoor levels use a wider panoramic sky feel.
     // v32 rotated the sky too slowly in open WLD1 areas, especially around BLES0008/map8.
     // Keep this isolated from wall/floor texture binding so only sky pan behaviour changes.
-    for (int y = 0; y < VIEW_CENTER_Y; ++y) for (int x = 0; x < FB_W; ++x) {
-        if (gSkyTex.ok) {
+    const int horizon = currentViewHorizonY();
+    const int lookOffset = horizon - VIEW_CENTER_Y;
+    bool playerHasSky = false;
+    int skyTextureIndex = 0;
+    const TextureBitmap* activeSky = floorTextureForCell((int)floorf(gPlayerX),
+        (int)floorf(gPlayerY), true, playerHasSky, skyTextureIndex);
+    if (!playerHasSky || !activeSky || !activeSky->ok) activeSky = &gSkyTex;
+    const int pixelSizeX = std::max(1, std::min(2, gRenderPixelSizeX));
+    const int pixelSizeY = std::max(1, std::min(2, gRenderPixelSizeY));
+    for (int y = 0; y < horizon; y += pixelSizeY) for (int x = 0; x < FB_W; x += pixelSizeX) {
+        if (activeSky->ok) {
             // Preserve the established 16:9 angular scale in the centre and
             // reveal more wrapped sky on wider framebuffers. Dividing by the
             // dynamic width would stretch one sky panorama over every aspect.
             const int centeredX = x - (FB_W - BASE_FB_W) / 2;
-            const int sx = (int)((centeredX * (int)gSkyTex.width) / BASE_FB_W +
-                                 (int)(gPlayerA * SKY_SCROLL_SCALE_V33));
-            int sy = (int)((y * (int)gSkyTex.height * SKY_VERTICAL_SCALE_V33) / VIEW_CENTER_Y);
+            const float sx = (float)centeredX * (float)activeSky->width / (float)BASE_FB_W +
+                             gPlayerA * SKY_SCROLL_SCALE_V33;
+            const int sourceY = y + (pixelSizeY - 1) / 2 - lookOffset;
+            int sy = (int)((sourceY * (int)activeSky->height * SKY_VERTICAL_SCALE_V33) / VIEW_CENTER_Y);
             if (sy < 0) sy = 0;
-            if (sy >= (int)gSkyTex.height) sy = (int)gSkyTex.height - 1;
-            gFramebuffer[y * FB_W + x] = paletteColor(sampleTextureBitmap(gSkyTex, sx, sy));
+            if (sy >= (int)activeSky->height) sy = (int)activeSky->height - 1;
+            // The source panoramas are clean. Fractional horizontal sampling
+            // prevents duplicated source columns from becoming vertical cloud
+            // streaks when 256-pixel skies are expanded to wide Android views.
+            const unsigned int color = sampleSkyColorFiltered(*activeSky, sx, sy);
+            for (int py = y; py < std::min(horizon, y + pixelSizeY); ++py)
+                for (int px = x; px < std::min(FB_W, x + pixelSizeX); ++px)
+                    gFramebuffer[py * FB_W + px] = color;
         } else {
-            int v = 72 + (y * 64) / VIEW_CENTER_Y;
-            gFramebuffer[y * FB_W + x] = 0xff000000u | ((unsigned)v << 16) | ((unsigned)(v / 2) << 8) | (unsigned)(v / 3);
+            int v = 72 + (std::max(0, y - lookOffset) * 64) / VIEW_CENTER_Y;
+            if (v > 136) v = 136;
+            const unsigned int color = 0xff000000u | ((unsigned)v << 16) |
+                ((unsigned)(v / 2) << 8) | (unsigned)(v / 3);
+            for (int py = y; py < std::min(horizon, y + pixelSizeY); ++py)
+                for (int px = x; px < std::min(FB_W, x + pixelSizeX); ++px)
+                    gFramebuffer[py * FB_W + px] = color;
         }
     }
 }
@@ -5332,7 +5693,7 @@ static void __attribute__((unused)) drawRoomRendererLegacy() {
 static int projectWorldYPortal(int worldZ, float distance) {
     if (distance < 0.025f) distance = 0.025f;
     const float projection = (float)FB_H / ORIGINAL_VERTICAL_REFERENCE;
-    const float y = (float)VIEW_CENTER_Y - ((float)(worldZ - gPlayerEyeZ) * projection / distance);
+    const float y = (float)currentViewHorizonY() - ((float)(worldZ - gPlayerEyeZ) * projection / distance);
     return (int)floorf(y + 0.5f);
 }
 
@@ -5358,21 +5719,34 @@ static void drawPortalPlaneSegment(int x, int y0, int y1, float rayX, float rayY
     const float projection = (float)FB_H / ORIGINAL_VERTICAL_REFERENCE;
     y0 = std::max(0, y0);
     y1 = std::min(VIEW_H - 1, y1);
-    for (int y = y0; y <= y1; ++y) {
-        if (filled[y]) continue;
-        const float denom = floorPlane ? ((float)y - (float)VIEW_CENTER_Y) : ((float)VIEW_CENTER_Y - (float)y);
-        if (denom <= 0.25f) continue;
+    const int pixelSize = std::max(1, std::min(2, gRenderPixelSizeY));
+    for (int blockY = y0; blockY <= y1;) {
+        const int blockEnd = std::min(y1, pixelSize == 2 ? ((blockY | 1)) : blockY);
+        const int y = (blockY + blockEnd) / 2;
+        bool needsPixel = false;
+        for (int py = blockY; py <= blockEnd; ++py) needsPixel = needsPixel || !filled[py];
+        if (!needsPixel) { blockY = blockEnd + 1; continue; }
+        const int horizon = currentViewHorizonY();
+        const float denom = floorPlane ? ((float)y - (float)horizon) : ((float)horizon - (float)y);
+        if (denom <= 0.25f) { blockY = blockEnd + 1; continue; }
         const float numerator = floorPlane ? (float)(gPlayerEyeZ - planeZ) : (float)(planeZ - gPlayerEyeZ);
         const float distance = numerator * projection / denom;
         const float edgeTolerance = std::max(0.003f, distance * 0.03f);
-        if (distance < nearDistance - edgeTolerance || distance > farDistance + edgeTolerance || distance <= 0.01f) continue;
+        if (distance < nearDistance - edgeTolerance || distance > farDistance + edgeTolerance || distance <= 0.01f) {
+            blockY = blockEnd + 1;
+            continue;
+        }
         const float wx = gPlayerX + rayX * distance;
         const float wy = gPlayerY + rayY * distance;
         const unsigned char paletteIndex = sampleTextureBitmap(*texture,
             (int)floorf(wx * (float)texture->width), (int)floorf(wy * (float)texture->height));
-        gFramebuffer[y * FB_W + x] = shadeColor(paletteColor(paletteIndex), blockLightAt(block, distance, 0));
-        gWallDepth[(size_t)y * FB_W + (size_t)x] = distance;
-        filled[y] = true;
+        const unsigned int color = shadeColor(paletteColor(paletteIndex), blockLightAt(block, distance, 0));
+        for (int py = blockY; py <= blockEnd; ++py) if (!filled[py]) {
+            gFramebuffer[py * FB_W + x] = color;
+            gWallDepth[(size_t)py * FB_W + (size_t)x] = distance;
+            filled[py] = true;
+        }
+        blockY = blockEnd + 1;
     }
 }
 
@@ -5410,7 +5784,7 @@ static PortalWallVerticalMapping portalWallVerticalMapping(int firstHeight, int 
 
 static int portalWallTextureY(float distance, int screenY, int anchorWorld, bool unpegged, int textureHeight) {
     const float projection = (float)FB_H / ORIGINAL_VERTICAL_REFERENCE;
-    const float worldAtY = (float)gPlayerEyeZ + ((float)VIEW_CENTER_Y - (float)screenY) * distance / projection;
+    const float worldAtY = (float)gPlayerEyeZ + ((float)currentViewHorizonY() - (float)screenY) * distance / projection;
     int texY = (int)floorf((float)anchorWorld - worldAtY);
     if (unpegged) texY += textureHeight - 1;
     return texY;
@@ -5424,13 +5798,22 @@ static void drawPortalWallSegment(int x, int y0, int y1, float distance, int bru
     y1 = std::min(VIEW_H - 1, y1);
     if (y0 > y1) return;
     int texX = brushOffset * (int)texture->width / 64;
-    for (int y = y0; y <= y1; ++y) {
-        if (filled[y]) continue;
+    const int pixelSize = std::max(1, std::min(2, gRenderPixelSizeY));
+    for (int blockY = y0; blockY <= y1;) {
+        const int blockEnd = std::min(y1, pixelSize == 2 ? (blockY | 1) : blockY);
+        const int y = (blockY + blockEnd) / 2;
+        bool needsPixel = false;
+        for (int py = blockY; py <= blockEnd; ++py) needsPixel = needsPixel || !filled[py];
+        if (!needsPixel) { blockY = blockEnd + 1; continue; }
         const int texY = portalWallTextureY(distance, y, anchorWorld, unpegged, (int)texture->height);
         const unsigned char paletteIndex = sampleTextureBitmap(*texture, texX, texY);
-        gFramebuffer[y * FB_W + x] = shadeColor(paletteColor(paletteIndex), blockLightAt(lightBlock, distance, side));
-        gWallDepth[(size_t)y * FB_W + (size_t)x] = distance;
-        filled[y] = true;
+        const unsigned int color = shadeColor(paletteColor(paletteIndex), blockLightAt(lightBlock, distance, side));
+        for (int py = blockY; py <= blockEnd; ++py) if (!filled[py]) {
+            gFramebuffer[py * FB_W + x] = color;
+            gWallDepth[(size_t)py * FB_W + (size_t)x] = distance;
+            filled[py] = true;
+        }
+        blockY = blockEnd + 1;
     }
 }
 
@@ -5441,14 +5824,22 @@ static void sealPortalWallGaps(int x, int y0, int y1, float distance, int brushO
     y0 = std::max(0, y0);
     y1 = std::min(VIEW_H - 1, y1);
     const int texX = brushOffset * (int)texture->width / 64;
-    for (int y = y0; y <= y1; ++y) {
-        if (filled[y]) continue;
+    const int pixelSize = std::max(1, std::min(2, gRenderPixelSizeY));
+    for (int blockY = y0; blockY <= y1;) {
+        const int blockEnd = std::min(y1, pixelSize == 2 ? (blockY | 1) : blockY);
+        const int y = (blockY + blockEnd) / 2;
+        bool needsPixel = false;
+        for (int py = blockY; py <= blockEnd; ++py) needsPixel = needsPixel || !filled[py];
+        if (!needsPixel) { blockY = blockEnd + 1; continue; }
         const int texY = portalWallTextureY(distance, y, anchorWorld, false, (int)texture->height);
         const unsigned char paletteIndex = sampleTextureBitmap(*texture, texX, texY);
-        gFramebuffer[(size_t)y * FB_W + (size_t)x] =
-            shadeColor(paletteColor(paletteIndex), blockLightAt(lightBlock, distance, side));
-        gWallDepth[(size_t)y * FB_W + (size_t)x] = distance;
-        filled[y] = true;
+        const unsigned int color = shadeColor(paletteColor(paletteIndex), blockLightAt(lightBlock, distance, side));
+        for (int py = blockY; py <= blockEnd; ++py) if (!filled[py]) {
+            gFramebuffer[(size_t)py * FB_W + (size_t)x] = color;
+            gWallDepth[(size_t)py * FB_W + (size_t)x] = distance;
+            filled[py] = true;
+        }
+        blockY = blockEnd + 1;
     }
 }
 
@@ -5582,6 +5973,59 @@ static void drawRuntimeProjectiles() {
     }
 }
 
+static void drawRuntimeImpactExplosions() {
+    if (gRuntimeImpactExplosions.empty()) return;
+    const float dirX = cosf(gPlayerA), dirY = sinf(gPlayerA);
+    const float planeScale = cameraPlaneScale();
+    const float planeX = -dirY * planeScale, planeY = dirX * planeScale;
+    const float invDet = 1.0f / (planeX * dirY - dirX * planeY);
+    struct ProjectedExplosion { const RuntimeImpactExplosion* effect; float depth; float lateral; };
+    std::vector<ProjectedExplosion> visible;
+    for (size_t i = 0; i < gRuntimeImpactExplosions.size(); ++i) {
+        const RuntimeImpactExplosion& effect = gRuntimeImpactExplosions[i];
+        if (effect.dead || !effect.definition || effect.definition->frames.empty()) continue;
+        const float relX = effect.x - gPlayerX, relY = effect.y - gPlayerY;
+        const float lateral = invDet * (dirY * relX - dirX * relY);
+        const float depth = invDet * (-planeY * relX + planeX * relY);
+        if (depth > 0.03f && fabsf(lateral / depth) < 1.5f)
+            visible.push_back(ProjectedExplosion{&effect, depth, lateral});
+    }
+    std::sort(visible.begin(), visible.end(), [](const ProjectedExplosion& first,
+        const ProjectedExplosion& second) { return first.depth > second.depth; });
+    for (size_t i = 0; i < visible.size(); ++i) {
+        const RuntimeImpactExplosion& effect = *visible[i].effect;
+        const GlobalObjectInfo& definition = *effect.definition;
+        const int frameIndex = std::min((int)definition.frames.size() - 1,
+                                        std::max(0, (int)(effect.age / 0.08f)));
+        const ObjectSpriteFrame& frame = definition.frames[(size_t)frameIndex];
+        if (frame.width <= 0 || frame.height <= 0 || frame.pixels.empty()) continue;
+        const LgldBlockInfo* block = currentLgldBlockForCell((int)floorf(effect.x), (int)floorf(effect.y));
+        if (!block) continue;
+        const int screenX = (int)((float)FB_W * 0.5f * (1.0f + visible[i].lateral / visible[i].depth));
+        int top = projectWorldYPortal((int)floorf(effect.z + (float)frame.height * 0.5f), visible[i].depth);
+        int bottom = projectWorldYPortal((int)floorf(effect.z - (float)frame.height * 0.5f), visible[i].depth);
+        if (top > bottom) std::swap(top, bottom);
+        const int halfWidth = std::max(1, (int)((float)frame.width * 0.5f *
+            ((float)FB_H / ORIGINAL_VERTICAL_REFERENCE) / visible[i].depth));
+        for (int y = std::max(0, top); y <= std::min(VIEW_H - 1, bottom); ++y) {
+            for (int x = std::max(0, screenX - halfWidth); x <= std::min(FB_W - 1, screenX + halfWidth); ++x) {
+                const size_t destination = (size_t)y * FB_W + (size_t)x;
+                if (visible[i].depth >= gWallDepth[destination]) continue;
+                const int sx = std::min(frame.width - 1,
+                    (x - (screenX - halfWidth)) * frame.width / std::max(1, halfWidth * 2 + 1));
+                const int sy = std::min(frame.height - 1,
+                    (y - top) * frame.height / std::max(1, bottom - top + 1));
+                const size_t source = (size_t)sy * (size_t)frame.width + (size_t)sx;
+                if (source >= frame.pixels.size() ||
+                    (source < frame.mask.size() && frame.mask[source] == 0u)) continue;
+                gFramebuffer[destination] = shadeColor(paletteColor(frame.pixels[source]),
+                    blockLightAt(*block, visible[i].depth, 0));
+                gWallDepth[destination] = visible[i].depth;
+            }
+        }
+    }
+}
+
 static void drawRuntimeImpactSparks() {
     if (gRuntimeImpactSparks.empty()) return;
     const float dirX = cosf(gPlayerA), dirY = sinf(gPlayerA);
@@ -5635,14 +6079,42 @@ static void sealOnePixelDepthPinholes() {
     }
 }
 
+static void applyWorldRenderPixelSize() {
+    const int pixelSizeX = std::max(1, std::min(2, gRenderPixelSizeX));
+    const int pixelSizeY = std::max(1, std::min(2, gRenderPixelSizeY));
+    if (pixelSizeX == 1 && pixelSizeY == 1) return;
+    // UI/HUD remain crisp. Only the 3-D viewport combines calculated samples
+    // into the selected horizontal/vertical output blocks.
+    for (int y = 0; y < VIEW_H; y += pixelSizeY) {
+        for (int x = 0; x < FB_W; x += pixelSizeX) {
+            const unsigned int color = gFramebuffer[(size_t)y * FB_W + (size_t)x];
+            const float depth = gWallDepth[(size_t)y * FB_W + (size_t)x];
+            for (int py = y; py < std::min(VIEW_H, y + pixelSizeY); ++py) {
+                for (int px = x; px < std::min(FB_W, x + pixelSizeX); ++px) {
+                    gFramebuffer[(size_t)py * FB_W + (size_t)px] = color;
+                    gWallDepth[(size_t)py * FB_W + (size_t)px] = depth;
+                }
+            }
+        }
+    }
+}
+
 static void drawRoomRenderer() {
     updatePlayerMotion();
+    updateAutomapDiscovery();
     updateRuntimeObjects();
+#ifndef NDEBUG
     updateOriginalVTableProbe();
-    updateOriginalSpanPrepProbe();
+#endif
+    // The former OTable preparation pass rebuilt a complete second set of
+    // rays solely for a disabled diagnostic surface renderer. The visible
+    // portal renderer below already generates the authoritative ray table.
+#ifndef NDEBUG
     updateHeightRayProbe();
+#endif
     drawSkyBackground();
-    for (int y = VIEW_CENTER_Y; y < VIEW_H; ++y)
+    const int horizon = currentViewHorizonY();
+    for (int y = horizon; y < VIEW_H; ++y)
         for (int x = 0; x < FB_W; ++x) gFramebuffer[(size_t)y * FB_W + (size_t)x] = 0xff080808u;
     std::fill(gWallDepth.begin(), gWallDepth.end(), 1.0e30f);
 
@@ -5650,12 +6122,15 @@ static void drawRoomRenderer() {
     const float planeScale = cameraPlaneScale();
     const float planeX = -dirY * planeScale, planeY = dirX * planeScale;
     const int startBlockIndex = currentLgldBlockIndexForCell((int)floorf(gPlayerX), (int)floorf(gPlayerY));
-    for (int x = 0; x < FB_W; ++x) {
+    const int pixelSize = std::max(1, std::min(2, gRenderPixelSizeX));
+    std::vector<OrigVtHit> hits;
+    hits.reserve(32);
+    for (int x = 0; x < FB_W; x += pixelSize) {
         bool filled[FB_H] = {false};
-        const float cameraX = 2.0f * (float)x / (float)FB_W - 1.0f;
+        const float sampleX = (float)x + (float)(pixelSize - 1) * 0.5f;
+        const float cameraX = 2.0f * sampleX / (float)FB_W - 1.0f;
         const float rayX = dirX + planeX * cameraX;
         const float rayY = dirY + planeY * cameraX;
-        std::vector<OrigVtHit> hits;
         buildOriginalStyleVTableForRay(rayX, rayY, hits);
         int previousBlockIndex = startBlockIndex;
         float nearDistance = 0.0f;
@@ -5665,9 +6140,9 @@ static void drawRoomRenderer() {
             const LgldBlockInfo* previous = currentLgldBlockByIndex(previousBlockIndex);
             const LgldBlockInfo* entered = currentLgldBlockByIndex(hit.blockIndex);
             if (!previous) break;
-            drawPortalPlaneSegment(x, clipTop, std::min(clipBottom, VIEW_CENTER_Y - 1), rayX, rayY,
+            drawPortalPlaneSegment(x, clipTop, std::min(clipBottom, horizon - 1), rayX, rayY,
                                    nearDistance, hit.distance, *previous, false, filled);
-            drawPortalPlaneSegment(x, std::max(clipTop, VIEW_CENTER_Y), clipBottom, rayX, rayY,
+            drawPortalPlaneSegment(x, std::max(clipTop, horizon), clipBottom, rayX, rayY,
                                    nearDistance, hit.distance, *previous, true, filled);
             if (!entered) {
                 const TextureBitmap* texture = gWallTexCount > 0 ? &gWallTex[0] : nullptr;
@@ -5732,20 +6207,33 @@ static void drawRoomRenderer() {
         }
         const LgldBlockInfo* last = currentLgldBlockByIndex(previousBlockIndex);
         if (last && clipTop <= clipBottom) {
-            drawPortalPlaneSegment(x, clipTop, std::min(clipBottom, VIEW_CENTER_Y - 1), rayX, rayY,
+            drawPortalPlaneSegment(x, clipTop, std::min(clipBottom, horizon - 1), rayX, rayY,
                                    nearDistance, 64.0f, *last, false, filled);
-            drawPortalPlaneSegment(x, std::max(clipTop, VIEW_CENTER_Y), clipBottom, rayX, rayY,
+            drawPortalPlaneSegment(x, std::max(clipTop, horizon), clipBottom, rayX, rayY,
                                    nearDistance, 64.0f, *last, true, filled);
+        }
+        // The expensive portal/V-table traversal runs once for a 2-column
+        // block whenever horizontal 2x sampling is active. Copy its completed
+        // depth-tested column before billboards and effects are composited.
+        if (pixelSize == 2 && x + 1 < FB_W) {
+            for (int y = 0; y < VIEW_H; ++y) {
+                gFramebuffer[(size_t)y * FB_W + (size_t)(x + 1)] =
+                    gFramebuffer[(size_t)y * FB_W + (size_t)x];
+                gWallDepth[(size_t)y * FB_W + (size_t)(x + 1)] =
+                    gWallDepth[(size_t)y * FB_W + (size_t)x];
+            }
         }
     }
     sealOnePixelDepthPinholes();
     drawPlacedObjectBillboards();
     drawRuntimeProjectiles();
+    drawRuntimeImpactExplosions();
     drawRuntimeImpactSparks();
+    applyWorldRenderPixelSize();
 }
 
 
-static unsigned int mapColorForCell(int cell) {
+static unsigned int __attribute__((unused)) mapColorForCell(int cell) {
     if (cell <= 0) return 0x66202020u;
     static const unsigned int colors[] = {
         0xff303030u, 0xff605040u, 0xff405060u, 0xff506040u,
@@ -5774,70 +6262,94 @@ static void drawLineSafe(int x0, int y0, int x1, int y1, unsigned int argb) {
     }
 }
 
-static void __attribute__((unused)) drawMiniMapOverlay() {
-    const AssetInfo* ai = currentLgldAsset();
-    if (ai) {
-        const int size = 64;
-        const int ox = FB_W - size - 8;
-        const int oy = FB_H - size - 8;
-        fillRectSafe(ox - 2, oy - 2, size + 4, size + 4, 0xcc000000u);
-        const int minX = std::max(0, ai->lgldMinX);
-        const int minY = std::max(0, ai->lgldMinY);
-        const int maxX = std::min(127, ai->lgldMaxX);
-        const int maxY = std::min(127, ai->lgldMaxY);
-        const int spanX = std::max(1, maxX - minX + 1);
-        const int spanY = std::max(1, maxY - minY + 1);
-        for (int yy = 0; yy < size; ++yy) {
-            for (int xx = 0; xx < size; ++xx) {
-                const int mx = minX + (xx * spanX) / size;
-                const int my = minY + (yy * spanY) / size;
-                const short v = currentLgldCellRaw(mx, my);
-                unsigned int col = 0xff101010u;
-                if (v > 0) {
-                    const LgldBlockInfo* mb = currentLgldBlockForCell(mx, my);
-                    if (mb && (mb->effect || mb->trigger || mb->trigger2 || (mb->attributes & 0xf0u))) {
-                        col = 0xffa07020u;
-                    } else if (mb && ((mb->attributes & 3u) != 0u)) {
-                        const unsigned int pulse = (unsigned int)(96 + ((mb->attributes & 3u) * 32u));
-                        col = 0xff000000u | (pulse << 16) | (0x3020u);
-                    } else if (mb) {
-                        int shade = 64 + (mb->floorHeight + 128) / 4;
-                        if (shade < 28) shade = 28;
-                        if (shade > 180) shade = 180;
-                        col = 0xff000000u | ((unsigned int)(shade / 3) << 16) | ((unsigned int)shade << 8) | (unsigned int)(shade / 3);
-                    } else {
-                        col = 0xff304030u;
-                    }
-                }
-                else if (v < 0) col = mapColorForCell(1 + ((-v) % 8));
-                putPixelSafe(ox + xx, oy + yy, col);
-            }
-        }
-        const int px = ox + (int)(((gPlayerX - (float)minX) / (float)spanX) * (float)size);
-        const int py = oy + (int)(((gPlayerY - (float)minY) / (float)spanY) * (float)size);
-        fillRectSafe(px - 1, py - 1, 3, 3, 0xffffffffu);
-        drawLineSafe(px, py, px + (int)(cosf(gPlayerA) * 8.0f), py + (int)(sinf(gPlayerA) * 8.0f), 0xffffffffu);
-        return;
+static int originalMapBoundaryColor(int mx, int my, int nx, int ny) {
+    const short currentRaw = currentLgldCellRaw(mx, my);
+    const short neighbourRaw = currentLgldCellRaw(nx, ny);
+    if (currentRaw == neighbourRaw || (currentRaw <= 0 && neighbourRaw <= 0)) return 0;
+    if (currentRaw <= 0 || neighbourRaw <= 0) return 2;
+    const LgldBlockInfo* current = currentLgldBlockForCell(mx, my);
+    const LgldBlockInfo* neighbour = currentLgldBlockForCell(nx, ny);
+    if (!current || !neighbour) return 2;
+    const int floorDifference = abs(current->floorHeight - neighbour->floorHeight);
+    if (floorDifference != 0) return floorDifference <= ORIG_PLAYER_MAX_RISE ? 16 : 2;
+    if (current->ceilHeight != neighbour->ceilHeight) return 195;
+    if (current->floorTex != neighbour->floorTex) return 16;
+    if (current->ceilTex != neighbour->ceilTex) return 195;
+    return 0;
+}
+
+static void drawIngameMap() {
+    // Map.asm renders 80 x 50 four-pixel blocks on a black 320 x 200 screen.
+    const double now = nowSeconds();
+    if (gMapPanLastTime <= 0.0) gMapPanLastTime = now;
+    float dt = (float)(now - gMapPanLastTime);
+    gMapPanLastTime = now;
+    dt = std::max(0.0f, std::min(0.10f, dt));
+    const float panX = fabsf(gAnalogLX) >= 0.12f ? gAnalogLX : 0.0f;
+    const float panY = fabsf(gAnalogLY) >= 0.12f ? gAnalogLY : 0.0f;
+    const float panSpeed = 24.0f;
+    gMapOriginX = std::max(0.0f, std::min(48.0f, gMapOriginX + panX * panSpeed * dt));
+    gMapOriginY = std::max(0.0f, std::min(78.0f, gMapOriginY + panY * panSpeed * dt));
+
+    std::fill(gFramebuffer.begin(), gFramebuffer.end(), 0xff000000u);
+    const int scale = 4;
+    const int visibleColumns = 80;
+    const int visibleRows = 50;
+    const int mapLeft = (FB_W - visibleColumns * scale) / 2;
+    const int firstMapX = std::max(0, std::min(48, (int)floorf(gMapOriginX + 0.5f)));
+    const int firstMapY = std::max(0, std::min(78, (int)floorf(gMapOriginY + 0.5f)));
+    const unsigned int blockColor = paletteColor(243);
+
+    // Original discovered blocks are solid palette-243 squares. Drawing them
+    // first prevents a neighbouring fill from overwriting a coloured edge.
+    for (int sy = 0; sy < visibleRows; ++sy) for (int sx = 0; sx < visibleColumns; ++sx) {
+        const int mx = firstMapX + sx;
+        const int my = firstMapY + sy;
+        if (automapCellSeen(mx, my) && currentLgldCellRaw(mx, my) > 0)
+            fillRectSafe(mapLeft + sx * scale, sy * scale, scale, scale, blockColor);
     }
 
-    const int scale = 4;
-    const int ox = 8;
-    const int oy = FB_H - MAP_H * scale - 8;
-    fillRectSafe(ox - 2, oy - 2, MAP_W * scale + 4, MAP_H * scale + 4, 0xcc000000u);
-    for (int my = 0; my < MAP_H; ++my) {
-        for (int mx = 0; mx < MAP_W; ++mx) {
-            int cell = mapCell(mx, my);
-            unsigned int col = mapColorForCell(cell);
-            if (cell == 0) col = 0xaa202020u;
-            fillRectSafe(ox + mx * scale, oy + my * scale, scale - 1, scale - 1, col);
+    for (int sy = 0; sy < visibleRows; ++sy) for (int sx = 0; sx < visibleColumns; ++sx) {
+        const int mx = firstMapX + sx;
+        const int my = firstMapY + sy;
+        if (!automapCellSeen(mx, my)) continue;
+        const int px = mapLeft + sx * scale;
+        const int py = sy * scale;
+        const int leftColor = originalMapBoundaryColor(mx, my, mx - 1, my);
+        const int upperColor = originalMapBoundaryColor(mx, my, mx, my - 1);
+        if (leftColor != 0) drawLineSafe(px, py, px, py + scale - 1, paletteColor((unsigned char)leftColor));
+        if (upperColor != 0) drawLineSafe(px, py, px + scale - 1, py, paletteColor((unsigned char)upperColor));
+        if (sx == visibleColumns - 1) {
+            const int rightColor = originalMapBoundaryColor(mx, my, mx + 1, my);
+            if (rightColor != 0) drawLineSafe(px + scale - 1, py, px + scale - 1,
+                                              py + scale - 1, paletteColor((unsigned char)rightColor));
+        }
+        if (sy == visibleRows - 1) {
+            const int lowerColor = originalMapBoundaryColor(mx, my, mx, my + 1);
+            if (lowerColor != 0) drawLineSafe(px, py + scale - 1, px + scale - 1,
+                                              py + scale - 1, paletteColor((unsigned char)lowerColor));
         }
     }
-    const int px = ox + (int)(gPlayerX * (float)scale);
-    const int py = oy + (int)(gPlayerY * (float)scale);
-    fillRectSafe(px - 1, py - 1, 3, 3, 0xffffffffu);
-    const int lx = px + (int)(cosf(gPlayerA) * 8.0f);
-    const int ly = py + (int)(sinf(gPlayerA) * 8.0f);
-    drawLineSafe(px, py, lx, ly, 0xffffffffu);
+
+    // PlayerMapPics from Map.asm: eight 3 x 3 direction masks, blinking
+    // between palette colours 41 and 243.
+    static const unsigned char playerMasks[8][3] = {
+        {4, 7, 4}, {6, 6, 1}, {7, 2, 2}, {3, 3, 4},
+        {1, 7, 1}, {4, 3, 3}, {2, 2, 7}, {1, 6, 6}
+    };
+    int direction = ((int)floorf(gPlayerA / 0.78539816339f + 0.5f) + 2) & 7;
+    const int playerScreenX = (int)floorf(gPlayerX) - firstMapX;
+    const int playerScreenY = (int)floorf(gPlayerY) - firstMapY;
+    if (playerScreenX >= 0 && playerScreenX < visibleColumns &&
+        playerScreenY >= 0 && playerScreenY < visibleRows) {
+        const int px = mapLeft + playerScreenX * scale;
+        const int py = playerScreenY * scale;
+        const unsigned int playerColor = paletteColor((unsigned char)(((int)(now * 6.25) & 1) ? 243 : 41));
+        for (int row = 0; row < 3; ++row) for (int column = 0; column < 3; ++column) {
+            if ((playerMasks[direction][row] & (1u << (2 - column))) != 0u)
+                putPixelSafe(px + column, py + 1 + row, playerColor);
+        }
+    }
 }
 
 static void __attribute__((unused)) drawDiagnosticsOverlay() {
@@ -5888,7 +6400,7 @@ static void drawLgldMapPreview(const AssetInfo& ai) {
     }
 }
 
-static void drawAssetExplorer() {
+static void __attribute__((unused)) drawAssetExplorer() {
     for (int y = 0; y < FB_H; ++y) {
         for (int x = 0; x < FB_W; ++x) {
             unsigned int shade = (unsigned int)(10 + (y * 22) / FB_H);
@@ -5940,6 +6452,12 @@ static void drawAssetExplorer() {
         drawText(4, y, line);
         y += 10;
     }
+}
+
+static void drawMissingGameDataScreen() {
+    std::fill(gFramebuffer.begin(), gFramebuffer.end(), 0xff000000u);
+    drawTextCentered(FB_H / 2 - 6, "GAME DATA ERROR");
+    drawTextCentered(FB_H / 2 + 6, "PLEASE RESTART");
 }
 
 static unsigned int presentationPaletteColor(const GfxBitmap& picture, unsigned char index) {
@@ -6011,6 +6529,7 @@ static bool drawPresentationPicture(const std::string& name) {
 }
 
 static void setFrontendState(FrontendState state) {
+    const FrontendState previousState = gFrontendState;
     if (state == FRONTEND_PAUSE && gFrontendState != FRONTEND_PAUSE) {
         std::lock_guard<std::mutex> lock(gGameSnapshotMutex);
         gPauseBackground = gHaveGameSnapshot ? gLastGameFramebuffer : gFramebuffer;
@@ -6028,6 +6547,14 @@ static void setFrontendState(FrontendState state) {
     if (state == FRONTEND_GAME) {
         gMoveLastTime = gFrontendStateSince;
         gObjectLastTime = gFrontendStateSince;
+    }
+    if (state == FRONTEND_MAP && previousState != FRONTEND_MAP) {
+        // Map.asm starts at player-39/player-24 and clamps its 80 x 50 window
+        // to the 128 x 128 level boundaries.
+        gMapOriginX = (float)std::max(0, std::min(48, (int)floorf(gPlayerX) - 39));
+        gMapOriginY = (float)std::max(0, std::min(78, (int)floorf(gPlayerY) - 24));
+        gMapPanLastTime = gFrontendStateSince;
+        playGlobalSoundCode(2);
     }
 }
 
@@ -6145,17 +6672,17 @@ static const char* controllerButtonName(int key) {
 static void drawControlsMenu() {
     drawPresentationPicture("BTIT");
     drawPresentationTextCentered(74, "CONTROLS");
-    const int bindings[] = {gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey};
-    static const char* functions[] = {"FIRE", "ACTIVATE", "NEXT WEAPON", "RUN", "MENU"};
-    for (int i = 0; i < 5; ++i) {
+    const int bindings[] = {gFireKey, gActivateKey, gWeaponKey, gRunKey, gMapKey, gMenuKey};
+    static const char* functions[] = {"FIRE", "ACTIVATE", "NEXT WEAPON", "RUN", "MAP", "MENU"};
+    for (int i = 0; i < 6; ++i) {
         const int y = 98 + i * 14;
         char line[48];
         snprintf(line, sizeof(line), "%s  %s", functions[i], controllerButtonName(bindings[i]));
         if (i == gControlsMenuSelection) fillPresentationRect(57, y - 4, 206, 16, 0xff805020u);
         drawPresentationTextCentered(y, line);
     }
-    if (gControlsMenuSelection == 5) fillPresentationRect(57, 164, 206, 16, 0xff805020u);
-    drawPresentationTextCentered(168, "MAIN PAGE");
+    if (gControlsMenuSelection == 6) fillPresentationRect(57, 178, 206, 16, 0xff805020u);
+    drawPresentationTextCentered(182, "MAIN PAGE");
     if (gControlCapture >= 0) {
         fillPresentationRect(49, 203, 222, 15, 0xff204080u);
         drawPresentationTextCentered(207, "PRESS CONTROLLER BUTTON");
@@ -6190,12 +6717,46 @@ static void drawGameOptionsMenu() {
     }
 }
 
+static void toggleRenderPixelSize() {
+    if (gRenderPixelSizeX == 1 && gRenderPixelSizeY == 1) {
+        gRenderPixelSizeX = 2; gRenderPixelSizeY = 1;
+    } else if (gRenderPixelSizeX == 2 && gRenderPixelSizeY == 1) {
+        gRenderPixelSizeX = 1; gRenderPixelSizeY = 2;
+    } else if (gRenderPixelSizeX == 1 && gRenderPixelSizeY == 2) {
+        gRenderPixelSizeX = 2; gRenderPixelSizeY = 2;
+    } else {
+        gRenderPixelSizeX = 1; gRenderPixelSizeY = 1;
+    }
+    playSoundResource("SWT1");
+    saveControlBindings();
+
+    if (gFrontendState == FRONTEND_PAUSE && currentLgldAsset()) {
+        // Re-render one frozen world frame immediately. This makes the new
+        // sampling mode visible behind the still-open pause menu instead of
+        // waiting for RESUME.
+        const float savedLX = gAnalogLX, savedLY = gAnalogLY;
+        const float savedRX = gAnalogRX, savedRY = gAnalogRY;
+        gAnalogLX = gAnalogLY = gAnalogRX = gAnalogRY = 0.0f;
+        const double now = nowSeconds();
+        gMoveLastTime = now;
+        gObjectLastTime = now;
+        drawRoomRenderer();
+        drawOriginalHud();
+        gPauseBackground = gFramebuffer;
+        gAnalogLX = savedLX; gAnalogLY = savedLY;
+        gAnalogRX = savedRX; gAnalogRY = savedRY;
+    }
+}
+
 static void drawPauseMenu() {
     if (gPauseBackground.size() == gFramebuffer.size()) gFramebuffer = gPauseBackground;
-    drawTextCentered(58, "GAME MENU");
-    static const char* entries[] = {"RESUME", "RESTART LEVEL", "QUIT TO TITLE"};
-    for (int i = 0; i < 3; ++i) {
-        const int y = 78 + i * 14;
+    drawTextCentered(51, "GAME MENU");
+    char renderSize[32];
+    snprintf(renderSize, sizeof(renderSize), "RENDER SIZE  %dx%d",
+             gRenderPixelSizeX, gRenderPixelSizeY);
+    const char* entries[] = {"RESUME", renderSize, "RESTART LEVEL", "QUIT TO TITLE"};
+    for (int i = 0; i < 4; ++i) {
+        const int y = 71 + i * 14;
         if (i == gPauseMenuSelection) fillRectSafe((FB_W - 136) / 2, y - 4, 136, 15, 0xff604020u);
         drawTextCentered(y, entries[i]);
     }
@@ -6341,6 +6902,7 @@ static void updateAndDrawFrontend() {
             break;
         }
         case FRONTEND_GAME: break;
+        case FRONTEND_MAP: drawIngameMap(); break;
         case FRONTEND_PAUSE: drawPauseMenu(); break;
         case FRONTEND_TERMINAL: drawRuntimeTerminal(); break;
     }
@@ -6355,6 +6917,32 @@ static void applyOriginalRedHitPalette() {
         const unsigned int b = (pixel >> 16) & 0xffu;
         const unsigned int intensity = std::min(255u, (r * 77u + g * 150u + b * 29u) >> 8);
         gFramebuffer[i] = 0xff000000u | intensity;
+    }
+}
+
+static void applyTeleportWhiteFade() {
+    if (!gTeleportActive || gTeleportStarted <= 0.0) return;
+    const double elapsed = std::max(0.0, nowSeconds() - gTeleportStarted);
+    float white = 0.0f;
+    if (elapsed <= TELEPORT_WHITE_PEAK_SECONDS) {
+        // TransEffect starts at $0400 (one eighth of the 8192-entry fog table)
+        // and advances by $0100 for each original 50 Hz tick.
+        white = 0.125f + 0.875f * (float)(elapsed / TELEPORT_WHITE_PEAK_SECONDS);
+    } else {
+        white = 1.0f - (float)((elapsed - TELEPORT_WHITE_PEAK_SECONDS) /
+            (TELEPORT_FADE_COMPLETE_SECONDS - TELEPORT_WHITE_PEAK_SECONDS));
+    }
+    white = std::max(0.0f, std::min(1.0f, white));
+    for (int y = 0; y < VIEW_H; ++y) for (int x = 0; x < FB_W; ++x) {
+        const size_t index = (size_t)y * FB_W + (size_t)x;
+        const unsigned int pixel = gFramebuffer[index];
+        const unsigned int r = pixel & 0xffu;
+        const unsigned int g = (pixel >> 8) & 0xffu;
+        const unsigned int b = (pixel >> 16) & 0xffu;
+        const unsigned int nr = (unsigned int)((float)r + (255.0f - (float)r) * white);
+        const unsigned int ng = (unsigned int)((float)g + (255.0f - (float)g) * white);
+        const unsigned int nb = (unsigned int)((float)b + (255.0f - (float)b) * white);
+        gFramebuffer[index] = 0xff000000u | (nb << 16) | (ng << 8) | nr;
     }
 }
 
@@ -6392,6 +6980,7 @@ static void drawFrame() {
         updateAndDrawFrontend();
     } else if (currentLgldAsset()) {
         drawRoomRenderer();
+        applyTeleportWhiteFade();
         drawOriginalHud();
         if (nowSeconds() < gPickupMessageUntil) drawTextCentered(146, gPickupMessage.c_str());
         applyOriginalRedHitPalette();
@@ -6402,7 +6991,11 @@ static void drawFrame() {
             gHaveGameSnapshot = true;
         }
     } else {
-        drawAssetExplorer();
+        // The asset browser was useful during early reverse-engineering builds,
+        // but it must never leak into the released game. A missing or damaged
+        // installation now gets a small, deterministic recovery message while
+        // Java repairs the bundled data on the next start.
+        drawMissingGameDataScreen();
     }
     maybeAutosaveGameProgress();
     updateFps();
@@ -6509,7 +7102,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_ast_breathlessamiga_MainActivity_n
         gFrontendState == FRONTEND_SOUND || gFrontendState == FRONTEND_CONTROLS ||
         gFrontendState == FRONTEND_GAME_OPTIONS || gFrontendState == FRONTEND_CREDITS) {
         code = "MUST";
-    } else if (gFrontendState == FRONTEND_GAME || gFrontendState == FRONTEND_LOADING ||
+    } else if (gFrontendState == FRONTEND_GAME || gFrontendState == FRONTEND_MAP || gFrontendState == FRONTEND_LOADING ||
                gFrontendState == FRONTEND_PAUSE || gFrontendState == FRONTEND_TERMINAL) {
         code = "MUS1";
         const AssetInfo* level = currentLgldAsset();
@@ -6531,6 +7124,11 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_ast_breathlessamiga_MainActivity_
     const bool requested = gQuitRequested;
     gQuitRequested = false;
     return requested ? (jboolean)1 : (jboolean)0;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeSetOuyaDevice(JNIEnv*, jclass, jboolean ouyaDevice) {
+    gOuyaDevice = ouyaDevice != 0;
+    LOGI("OUYA hardware detection=%s", gOuyaDevice ? "yes" : "no");
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeSetDataPath(JNIEnv* env, jclass, jstring path) {
@@ -6602,7 +7200,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
     glUseProgram(gProgram);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, gTexture);
-    const bool presentation = gFrontendState != FRONTEND_GAME && gFrontendState != FRONTEND_PAUSE &&
+    const bool presentation = gFrontendState != FRONTEND_GAME && gFrontendState != FRONTEND_MAP && gFrontendState != FRONTEND_PAUSE &&
                               gFrontendState != FRONTEND_TERMINAL;
     const int textureWidth = presentation ? ORIGINAL_W : FB_W;
     const int textureHeight = presentation ? PRESENTATION_H : FB_H;
@@ -6679,7 +7277,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
             else if (gControlCapture == 1) gActivateKey = keyCode;
             else if (gControlCapture == 2) gWeaponKey = keyCode;
             else if (gControlCapture == 3) gRunKey = keyCode;
-            else if (gControlCapture == 4) gMenuKey = keyCode;
+            else if (gControlCapture == 4) gMapKey = keyCode;
+            else if (gControlCapture == 5) gMenuKey = keyCode;
             saveControlBindings();
         }
         gControlCapture = -1;
@@ -6720,13 +7319,17 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         return;
     }
     if (gFrontendState == FRONTEND_PAUSE) {
-        if (keyCode == 19) gPauseMenuSelection = (gPauseMenuSelection + 2) % 3;
-        else if (keyCode == 20) gPauseMenuSelection = (gPauseMenuSelection + 1) % 3;
+        if (keyCode == 19) gPauseMenuSelection = (gPauseMenuSelection + 3) % 4;
+        else if (keyCode == 20) gPauseMenuSelection = (gPauseMenuSelection + 1) % 4;
+        else if ((keyCode == 21 || keyCode == 22) && gPauseMenuSelection == 1)
+            toggleRenderPixelSize();
         else if (isBackKey(keyCode) || keyCode == 82 || keyCode == gMenuKey || keyCode == 110)
             setFrontendState(FRONTEND_GAME);
         else if (isConfirmKey(keyCode)) {
             if (gPauseMenuSelection == 0) setFrontendState(FRONTEND_GAME);
             else if (gPauseMenuSelection == 1) {
+                toggleRenderPixelSize();
+            } else if (gPauseMenuSelection == 2) {
                 gRestoreLevelCheckpoint = true;
                 gRuntimeAssetIndex = -99999;
                 gPlayerStartChecked = false;
@@ -6736,6 +7339,15 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
                 setFrontendState(FRONTEND_TITLE);
             }
         }
+        return;
+    }
+    if (gFrontendState == FRONTEND_MAP) {
+        if (keyCode == gMapKey || keyCode == gMenuKey || isBackKey(keyCode))
+            setFrontendState(FRONTEND_GAME);
+        else if (keyCode == 21) gMapOriginX = std::max(0.0f, gMapOriginX - 4.0f);
+        else if (keyCode == 22) gMapOriginX = std::min(48.0f, gMapOriginX + 4.0f);
+        else if (keyCode == 19) gMapOriginY = std::max(0.0f, gMapOriginY - 4.0f);
+        else if (keyCode == 20) gMapOriginY = std::min(78.0f, gMapOriginY + 4.0f);
         return;
     }
     if (gFrontendState == FRONTEND_MENU) {
@@ -6774,16 +7386,22 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         return;
     }
     if (gFrontendState == FRONTEND_CONTROLS) {
-        if (keyCode == 19) gControlsMenuSelection = (gControlsMenuSelection + 5) % 6;
-        else if (keyCode == 20) gControlsMenuSelection = (gControlsMenuSelection + 1) % 6;
+        if (keyCode == 19) gControlsMenuSelection = (gControlsMenuSelection + 6) % 7;
+        else if (keyCode == 20) gControlsMenuSelection = (gControlsMenuSelection + 1) % 7;
         else if (isBackKey(keyCode)) setFrontendState(FRONTEND_MENU);
         else if (isConfirmKey(keyCode)) {
-            if (gControlsMenuSelection < 5) gControlCapture = gControlsMenuSelection;
+            if (gControlsMenuSelection < 6) gControlCapture = gControlsMenuSelection;
             else setFrontendState(FRONTEND_MENU);
         }
         return;
     }
     if (gLevelExitActive) return;
+    if (keyCode == gMapKey && !gPlayerDead) {
+        gAnalogLX = gAnalogLY = gAnalogRX = gAnalogRY = 0.0f;
+        gRunHeld = false;
+        setFrontendState(FRONTEND_MAP);
+        return;
+    }
     if (isBackKey(keyCode) || keyCode == 82 || keyCode == gMenuKey || keyCode == 110) {
         gPauseMenuSelection = 0;
         gAnalogLX = gAnalogLY = gAnalogRX = gAnalogRY = 0.0f;
@@ -6826,6 +7444,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
     gAnalogRX = rx;
     gAnalogRY = ry;
 
+#ifndef NDEBUG
     static double lastAnalogLog = 0.0;
     const double t = nowSeconds();
     const bool analogActive = fabsf(lx) > 0.05f || fabsf(ly) > 0.05f || fabsf(rx) > 0.05f || fabsf(ry) > 0.05f || fabsf(hatX) > 0.05f || fabsf(hatY) > 0.05f;
@@ -6833,6 +7452,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         LOGI("analog v64 column-height-anchor lx=%0.3f ly=%0.3f rx=%0.3f ry=%0.3f hat=%0.3f,%0.3f", (double)lx, (double)ly, (double)rx, (double)ry, (double)hatX, (double)hatY);
         lastAnalogLog = t;
     }
+#endif
 
     static int lastHatX = 0, lastHatY = 0;
     const int hx = (hatX > 0.5f) ? 1 : ((hatX < -0.5f) ? -1 : 0);
@@ -6848,7 +7468,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
                     gSoundVoices.clear();
                 }
             } else if (gSoundMenuSelection == 3) gMusicEnabled = !gMusicEnabled;
-        }
+        } else if (gFrontendState == FRONTEND_PAUSE && gPauseMenuSelection == 1 && hx != 0)
+            toggleRenderPixelSize();
         lastHatX = hx;
     }
     if (hy != lastHatY) {
@@ -6859,11 +7480,11 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
             if (hy > 0) gSoundMenuSelection = (gSoundMenuSelection + 1) % 5;
             else if (hy < 0) gSoundMenuSelection = (gSoundMenuSelection + 4) % 5;
         } else if (gFrontendState == FRONTEND_CONTROLS) {
-            if (hy > 0) gControlsMenuSelection = (gControlsMenuSelection + 1) % 6;
-            else if (hy < 0) gControlsMenuSelection = (gControlsMenuSelection + 5) % 6;
+            if (hy > 0) gControlsMenuSelection = (gControlsMenuSelection + 1) % 7;
+            else if (hy < 0) gControlsMenuSelection = (gControlsMenuSelection + 6) % 7;
         } else if (gFrontendState == FRONTEND_PAUSE) {
-            if (hy > 0) gPauseMenuSelection = (gPauseMenuSelection + 1) % 3;
-            else if (hy < 0) gPauseMenuSelection = (gPauseMenuSelection + 2) % 3;
+            if (hy > 0) gPauseMenuSelection = (gPauseMenuSelection + 1) % 4;
+            else if (hy < 0) gPauseMenuSelection = (gPauseMenuSelection + 3) % 4;
         } else if (gFrontendState == FRONTEND_TERMINAL) {
             const int count = runtimeTerminalChoiceCount();
             if (hy > 0) gRuntimeTerminalSelection = (gRuntimeTerminalSelection + 1) % count;
@@ -6891,7 +7512,7 @@ static void mapTouchToRenderedContent(float screenX, float screenY, int contentW
 
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeTouch(JNIEnv*, jclass, jfloat x, jfloat y, jint action) {
     if (action != 1) return; // ACTION_UP
-    const bool presentation = gFrontendState != FRONTEND_GAME && gFrontendState != FRONTEND_PAUSE &&
+    const bool presentation = gFrontendState != FRONTEND_GAME && gFrontendState != FRONTEND_MAP && gFrontendState != FRONTEND_PAUSE &&
                               gFrontendState != FRONTEND_TERMINAL;
     const int contentWidth = presentation ? ORIGINAL_W : FB_W;
     const int contentHeight = presentation ? PRESENTATION_H : FB_H;
@@ -6912,6 +7533,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
             gRuntimeBlocks.size() == gAssetInfos[(size_t)gAssetIndex].lgldBlockData.size();
         gMoveLastTime = nowSeconds();
         setFrontendState(FRONTEND_GAME);
+    } else if (gFrontendState == FRONTEND_MAP) {
+        setFrontendState(FRONTEND_GAME);
     } else if (gFrontendState == FRONTEND_MENU) {
         if (virtualY >= 91.0f && virtualY < 182.0f) {
             gFrontendMenuSelection = std::max(0, std::min(5, (int)((virtualY - 91.0f) / 14.0f)));
@@ -6925,10 +7548,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
     } else if (gFrontendState == FRONTEND_SOUND || gFrontendState == FRONTEND_CONTROLS) {
         setFrontendState(FRONTEND_MENU);
     } else if (gFrontendState == FRONTEND_PAUSE) {
-        if (virtualY >= 71.0f && virtualY < 113.0f) {
-            gPauseMenuSelection = std::max(0, std::min(2, (int)((virtualY - 71.0f) / 14.0f)));
+        if (virtualY >= 64.0f && virtualY < 120.0f) {
+            gPauseMenuSelection = std::max(0, std::min(3, (int)((virtualY - 64.0f) / 14.0f)));
             if (gPauseMenuSelection == 0) setFrontendState(FRONTEND_GAME);
             else if (gPauseMenuSelection == 1) {
+                toggleRenderPixelSize();
+            } else if (gPauseMenuSelection == 2) {
                 gRestoreLevelCheckpoint = true;
                 gRuntimeAssetIndex = -99999;
                 gPlayerStartChecked = false;

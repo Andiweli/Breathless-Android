@@ -2,6 +2,7 @@ package com.ast.breathlessamiga;
 
 import android.app.Activity;
 import android.content.pm.ActivityInfo;
+import android.os.Build;
 import android.view.View;
 import android.view.WindowManager;
 
@@ -19,6 +20,16 @@ final class PlatformUi {
 
     static View wrapContent(Activity activity, View content) {
         return content;
+    }
+
+    static boolean isOuyaDevice() {
+        return containsOuya(Build.MANUFACTURER) || containsOuya(Build.BRAND) ||
+                containsOuya(Build.MODEL) || containsOuya(Build.DEVICE) ||
+                containsOuya(Build.PRODUCT);
+    }
+
+    private static boolean containsOuya(String value) {
+        return value != null && value.toLowerCase(java.util.Locale.US).contains("ouya");
     }
 
     static void installSystemUiRestorer(final Activity activity) {

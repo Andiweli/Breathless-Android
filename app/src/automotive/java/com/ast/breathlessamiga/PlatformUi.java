@@ -5,6 +5,7 @@ import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Color;
+import android.os.Build;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowManager;
@@ -47,6 +48,16 @@ final class PlatformUi {
             }
         });
         return safeContainer;
+    }
+
+    static boolean isOuyaDevice() {
+        return containsOuya(Build.MANUFACTURER) || containsOuya(Build.BRAND) ||
+                containsOuya(Build.MODEL) || containsOuya(Build.DEVICE) ||
+                containsOuya(Build.PRODUCT);
+    }
+
+    private static boolean containsOuya(String value) {
+        return value != null && value.toLowerCase(java.util.Locale.US).contains("ouya");
     }
 
     static void installSystemUiRestorer(final Activity activity) {

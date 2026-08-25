@@ -1,6 +1,7 @@
 package com.ast.breathlessamiga;
 
 import android.app.Activity;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.InputDevice;
@@ -25,6 +26,25 @@ import java.util.concurrent.TimeUnit;
 public class MainActivity extends Activity {
     private static final String TAG = "Breathless";
     private static final float DEADZONE = 0.08f;
+    private static final String DATA_MARKER = ".breathless_data_ready_v3";
+    private static final String[] REQUIRED_GAME_FILES = {
+            "BLES0001.GLD", "BLES0002.GLD", "BLES0003.GLD", "BLES0004.GLD",
+            "BLES0006.GLD", "BLES0007.GLD", "BLES0008.GLD", "BLES0009.GLD",
+            "BLES0010.GLD", "BLES0011.GLD", "BLES0012.GLD", "BLES0013.GLD",
+            "BLES0014.GLD", "BLES0015.GLD", "BLES0016.GLD", "BLES0017.GLD",
+            "BLES0018.GLD", "BLES0019.GLD", "BLES0020.GLD", "BLES0021.GLD",
+            "BLES0022.GLD", "BLES0023.GLD", "BLES0024.GLD", "BLES0025.GLD",
+            "Panel04.raw", "Mirino01.raw", "Background01.raw"
+    };
+    private static final long[] REQUIRED_GAME_FILE_SIZES = {
+            623112L, 231483L, 872522L, 328386L,
+            5509L, 6135L, 6565L, 7990L,
+            7492L, 7539L, 6850L, 7646L,
+            8656L, 8448L, 6760L, 6613L,
+            6268L, 6437L, 7237L, 6517L,
+            8044L, 7110L, 8469L, 7817L,
+            12800L, 352L, 16384L
+    };
 
     private BreathlessView glView;
     private long lastAnalogLogMs = 0;
@@ -38,6 +58,7 @@ public class MainActivity extends Activity {
     }
 
     private static native void nativeSetDataPath(String path);
+    private static native void nativeSetOuyaDevice(boolean ouyaDevice);
     private static native void nativeSaveProgress();
     private static native void nativeKey(int keyCode, boolean pressed);
     private static native void nativeTouch(float x, float y, int action);
@@ -54,8 +75,10 @@ public class MainActivity extends Activity {
         PlatformUi.configureWindow(this);
         applyGameUi();
 
-        File dataDir = new File(getExternalFilesDir(null), "Breathless");
+        File dataDir = gameDataDirectory();
         ensureGameData(dataDir);
+        migrateLegacyState(dataDir);
+        nativeSetOuyaDevice(PlatformUi.isOuyaDevice());
         nativeSetDataPath(dataDir.getAbsolutePath());
 
         glView = new BreathlessView(this);
@@ -257,8 +280,8 @@ public class MainActivity extends Activity {
                     Math.abs(rawZ) > 0.03f || Math.abs(rawRz) > 0.03f ||
                     Math.abs(rawRx) > 0.03f || Math.abs(rawRy) > 0.03f ||
                     Math.abs(hatX) > 0.03f || Math.abs(hatY) > 0.03f;
-            if (active && now - lastAnalogLogMs > 1200) {
-                Log.i(TAG, "analog java v26 source=" + event.getSource() +
+            if (BuildConfig.DEBUG && active && now - lastAnalogLogMs > 1200) {
+                Log.i(TAG, "analog java v32 source=" + event.getSource() +
                         " dev=" + event.getDeviceId() +
                         " X=" + rawX + " Y=" + rawY +
                         " Z=" + rawZ + " RZ=" + rawRz +
@@ -290,19 +313,99 @@ public class MainActivity extends Activity {
         return Math.abs(ca) >= Math.abs(cb) ? ca : cb;
     }
 
+    private File gameDataDirectory() {
+        // Before KitKat, app-specific external files could still require the
+        // legacy storage permission on vendor builds. OUYA runs Android 4.1,
+        // so keep its required runtime data in private, always-writable storage.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) {
+            if (BuildConfig.DEBUG)
+                Log.i(TAG, "Using internal game-data storage on pre-KitKat Android");
+            return new File(getFilesDir(), "Breathless");
+        }
+        File storageRoot = getExternalFilesDir(null);
+        try {
+            if (storageRoot != null && !storageRoot.exists() && !storageRoot.mkdirs()) {
+                storageRoot = null;
+            }
+            if (storageRoot != null && !storageRoot.canWrite()) {
+                storageRoot = null;
+            }
+        } catch (SecurityException denied) {
+            storageRoot = null;
+        }
+        if (storageRoot == null) {
+            storageRoot = getFilesDir();
+            Log.w(TAG, "External app storage unavailable or read-only; using internal storage");
+        }
+        return new File(storageRoot, "Breathless");
+    }
+
+    private void migrateLegacyState(File currentDataDir) {
+        try {
+            File externalRoot = getExternalFilesDir(null);
+            if (externalRoot == null) return;
+            File legacyDataDir = new File(externalRoot, "Breathless");
+            if (legacyDataDir.getCanonicalPath().equals(currentDataDir.getCanonicalPath())) return;
+            copyLegacyStateFile(legacyDataDir, currentDataDir, "breathless_save_v1.dat");
+            copyLegacyStateFile(legacyDataDir, currentDataDir, "breathless_controls_v1.dat");
+        } catch (IOException | SecurityException error) {
+            Log.w(TAG, "Could not migrate legacy save data", error);
+        }
+    }
+
+    private void copyLegacyStateFile(File sourceDir, File targetDir, String name) throws IOException {
+        File source = new File(sourceDir, name);
+        File target = new File(targetDir, name);
+        if (!source.isFile() || target.exists()) return;
+        InputStream in = new java.io.FileInputStream(source);
+        FileOutputStream out = new FileOutputStream(target);
+        byte[] buffer = new byte[16 * 1024];
+        try {
+            int read;
+            while ((read = in.read(buffer)) > 0) out.write(buffer, 0, read);
+        } finally {
+            try { in.close(); } finally { out.close(); }
+        }
+        if (BuildConfig.DEBUG) Log.i(TAG, "Migrated legacy state: " + name);
+    }
+
+    private boolean hasCompleteGameData(File dataDir) {
+        for (int i = 0; i < REQUIRED_GAME_FILES.length; ++i) {
+            File file = new File(dataDir, REQUIRED_GAME_FILES[i]);
+            if (!file.isFile() || file.length() != REQUIRED_GAME_FILE_SIZES[i]) {
+                Log.w(TAG, "Game data missing or outdated: " + REQUIRED_GAME_FILES[i] +
+                        " (found " + (file.isFile() ? file.length() : 0L) +
+                        ", expected " + REQUIRED_GAME_FILE_SIZES[i] + ")");
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void ensureGameData(File dataDir) {
-        File marker = new File(dataDir, ".breathless_data_ready_v2");
-        if (marker.exists()) return;
+        File marker = new File(dataDir, DATA_MARKER);
+        if (marker.isFile() && hasCompleteGameData(dataDir)) {
+            if (BuildConfig.DEBUG) Log.i(TAG, "Bundled game data verified");
+            return;
+        }
         if (!dataDir.exists() && !dataDir.mkdirs()) {
             Log.e(TAG, "Could not create data dir: " + dataDir);
             return;
         }
         try {
+            if (BuildConfig.DEBUG) Log.i(TAG, "Installing or repairing bundled game data");
             unzipAsset("breathless_data.zip", dataDir);
+            if (!hasCompleteGameData(dataDir)) {
+                throw new IOException("Bundled game data did not pass validation after extraction");
+            }
             FileOutputStream out = new FileOutputStream(marker);
-            out.write('1');
-            out.close();
-        } catch (IOException e) {
+            try {
+                out.write('1');
+            } finally {
+                out.close();
+            }
+            if (BuildConfig.DEBUG) Log.i(TAG, "Bundled game data ready: " + dataDir);
+        } catch (IOException | SecurityException e) {
             Log.e(TAG, "Data extraction failed", e);
         }
     }
