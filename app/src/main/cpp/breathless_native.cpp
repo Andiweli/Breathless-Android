@@ -58,16 +58,19 @@ static unsigned char gPalette[256 * 3];
 static double gFps = 0.0;
 static unsigned gFpsFrames = 0;
 static double gFpsLastTime = 0.0;
-// The original game renders a 320x200 playfield.  A 356x200 buffer is the
-// closest integral-pixel 16:9 playfield; its 18-pixel side bands are genuine
-// extra world view while the original 320-pixel HUD remains centred.
-static const int FB_W = 356;
+// The original game renders a 320x200 playfield.  356x200 is the baseline
+// square-pixel 16:9 view.  Wider displays increase this logical width at
+// runtime so their side areas contain real world geometry rather than a
+// repeated outer pixel column.  The original 320-pixel HUD stays centred.
+static const int BASE_FB_W = 356;
+static const int MAX_FB_W = 800;
+static int FB_W = BASE_FB_W;
 static const int FB_H = 200;
 static const int VIEW_H = 160;
 static const int VIEW_CENTER_Y = VIEW_H / 2;
 static const int ORIGINAL_W = 320;
 static const int PRESENTATION_H = 240;
-static const int HUD_X = (FB_W - ORIGINAL_W) / 2;
+static int HUD_X = (FB_W - ORIGINAL_W) / 2;
 static const float ORIGINAL_VERTICAL_REFERENCE = 110.0f;
 static const int PICKUP_FLOAT_HEIGHT = 8;
 static const int PICKUP_BOB_AMPLITUDE = 3;
@@ -315,6 +318,7 @@ static std::vector<unsigned char> gHudPanelPixels;
 struct SoundResource {
     std::string name;
     std::string linkedName;
+    std::vector<std::string> randomNames;
     std::vector<signed char> pcm;
     int sampleRate = 11025;
     int volume = 64;
@@ -335,6 +339,7 @@ struct SoundVoice {
 static std::map<std::string, SoundResource> gSoundResources;
 static std::vector<SoundVoice> gSoundVoices;
 static std::mutex gAudioMutex;
+static unsigned int gSoundRandomState = 0x42524c53u;
 
 enum FrontendState {
     FRONTEND_LOGO1,
@@ -391,6 +396,7 @@ static double gGameResetMessageUntil = 0.0;
 static bool gSaveDirty = false;
 static double gLastProgressSaveTime = 0.0;
 static std::mutex gProgressSaveMutex;
+static std::mutex gControlSaveMutex;
 
 static std::vector<OrigVtHit> gOrigCenterVTable;
 static int gOrigCenterBlock = 0;
@@ -407,6 +413,10 @@ static double gOrigProbeLastLog = 0.0;
 // confirmed v54 wall-projection plane path; upper/lower wall rendering comes later.
 static const int ORIG_PLAYER_HEIGHT = 56;
 static const int ORIG_PLAYER_EYES_HEIGHT = 54;
+// movement.asm accelerates CPlayerY toward NewPlayerY by $8000 per 50 Hz
+// tick and caps it at $a0000. In world-units per second this is 1250 and 500.
+static const float ORIG_PLAYER_VERTICAL_ACCELERATION = 1250.0f;
+static const float ORIG_PLAYER_VERTICAL_MAX_SPEED = 500.0f;
 // v63: allow one visible 32-unit step. v56 used 24 from the original notes,
 // but the tested LGLD maps contain normal-looking 32-unit stair transitions.
 static const int ORIG_PLAYER_MAX_RISE = 24;
@@ -475,6 +485,8 @@ static bool gPlayerStartChecked = false;
 static double gMoveLastTime = 0.0;
 static float gPlayerBaseZF = 0.0f;
 static float gPlayerVerticalSpeed = 0.0f;
+static float gPlayerCameraEyeZF = (float)ORIG_PLAYER_EYES_HEIGHT;
+static float gPlayerCameraVerticalSpeed = 0.0f;
 static float gPlayerBobPhase = 0.0f;
 static float gPlayerBobOffset = 0.0f;
 static bool gPlayerFalling = false;
@@ -514,6 +526,7 @@ static bool gTeleportActive = false;
 static double gTeleportStarted = 0.0;
 static double gTeleportCompleteAfter = 32.0 / 50.0;
 static const int TELEPORT_SOUND_GROUP = 2;
+static const int ENEMY_HIT_SOUND_GROUP_BASE = 1000;
 // One-shot audio is produced by a separate Android thread. Keep transitions
 // alive for a few output buffers after the last decoded sample, rather than
 // tearing down the scene on the exact final-sample timestamp.
@@ -2050,9 +2063,18 @@ static void loadSoundResources() {
                 if (fread(&bytes[0], 1, bytes.size(), file) == bytes.size()) {
                     SoundResource sound;
                     sound.name = name;
+                    sound.type = (int)(int8_t)bytes[14];
+                    sound.code = bytes[15];
                     bool hasLink = false;
                     for (int linkByte = 0; linkByte < 4; ++linkByte) if (bytes[(size_t)linkByte] != 0u) hasLink = true;
-                    if (hasLink) sound.linkedName = safeFixedName(&bytes[0], 4);
+                    if (sound.type < 0 && sound.code > 0) {
+                        const unsigned int choices = std::min((unsigned int)sound.code,
+                                                              (unsigned int)(bytes.size() / 4u));
+                        for (unsigned int choice = 0; choice < choices; ++choice) {
+                            const std::string randomName = safeFixedName(&bytes[choice * 4u], 4);
+                            if (!randomName.empty()) sound.randomNames.push_back(randomName);
+                        }
+                    } else if (hasLink) sound.linkedName = safeFixedName(&bytes[0], 4);
                     // TMap.i declares snd_length as "Lunghezza in word" and
                     // Paula's ac_len register also counts 16-bit words.  The
                     // previous decoder treated that value as bytes and cut
@@ -2062,8 +2084,6 @@ static void loadSoundResources() {
                     const int period = (int)be16(&bytes[6]);
                     sound.volume = std::min(64, (int)be16(&bytes[8]));
                     sound.loop = (int)be16(&bytes[10]);
-                    sound.type = (int)(int8_t)bytes[14];
-                    sound.code = bytes[15];
                     if (period > 0) {
                         // TSP1 (global code 3) intentionally uses Paula period
                         // 1712, about 2071 Hz. The former generic 4 kHz floor
@@ -2098,13 +2118,39 @@ static const SoundResource* resolvedSoundResource(const SoundResource* settings)
     return sample;
 }
 
+static const SoundResource* selectedSoundResource(const SoundResource* settings) {
+    if (!settings || settings->randomNames.empty()) return settings;
+    gSoundRandomState ^= gSoundRandomState << 13;
+    gSoundRandomState ^= gSoundRandomState >> 17;
+    gSoundRandomState ^= gSoundRandomState << 5;
+    const std::string& selected = settings->randomNames[
+        (size_t)(gSoundRandomState % (unsigned int)settings->randomNames.size())];
+    std::map<std::string, SoundResource>::const_iterator found = gSoundResources.find(selected);
+    return found == gSoundResources.end() ? settings : &found->second;
+}
+
+static double soundResourceDurationLocked(const SoundResource* settings) {
+    if (!settings) return 0.0;
+    if (!settings->randomNames.empty()) {
+        double longest = 0.0;
+        for (size_t i = 0; i < settings->randomNames.size(); ++i) {
+            std::map<std::string, SoundResource>::const_iterator found =
+                gSoundResources.find(settings->randomNames[i]);
+            if (found != gSoundResources.end())
+                longest = std::max(longest, soundResourceDurationLocked(&found->second));
+        }
+        return longest;
+    }
+    const SoundResource* sample = resolvedSoundResource(settings);
+    return sample && !sample->pcm.empty() && sample->sampleRate > 0
+        ? (double)sample->pcm.size() / (double)sample->sampleRate : 0.0;
+}
+
 static double soundResourceDuration(const std::string& requestedName) {
     std::lock_guard<std::mutex> lock(gAudioMutex);
     std::map<std::string, SoundResource>::const_iterator found = gSoundResources.find(requestedName);
     if (found == gSoundResources.end()) return 0.0;
-    const SoundResource* sample = resolvedSoundResource(&found->second);
-    return sample && !sample->pcm.empty() && sample->sampleRate > 0
-        ? (double)sample->pcm.size() / (double)sample->sampleRate : 0.0;
+    return soundResourceDurationLocked(&found->second);
 }
 
 static void stopSoundGroup(int exclusiveGroup) {
@@ -2134,7 +2180,7 @@ static void playSoundResource(const std::string& requestedName, float pan = 0.0f
     std::lock_guard<std::mutex> lock(gAudioMutex);
     std::map<std::string, SoundResource>::const_iterator found = gSoundResources.find(requestedName);
     if (found == gSoundResources.end()) return;
-    const SoundResource* settings = &found->second;
+    const SoundResource* settings = selectedSoundResource(&found->second);
     const SoundResource* sample = resolvedSoundResource(settings);
     if (!sample || sample->pcm.empty()) return;
     if (exclusiveGroup != 0) {
@@ -2230,6 +2276,79 @@ static unsigned int readSaveU32(const std::vector<unsigned char>& bytes, size_t&
         ((unsigned int)bytes[offset + 3u] << 24);
     offset += 4u;
     return value;
+}
+
+static std::string controlSavePath() {
+    return gDataPath.empty() ? std::string() : gDataPath + "/breathless_controls_v1.dat";
+}
+
+static bool validControllerBinding(int keyCode) {
+    return keyCode > 0 && keyCode <= 512 && keyCode != 4 && keyCode != 111;
+}
+
+static bool saveControlBindings() {
+    std::lock_guard<std::mutex> saveLock(gControlSaveMutex);
+    const std::string path = controlSavePath();
+    if (path.empty()) return false;
+    std::vector<unsigned char> bytes;
+    static const unsigned char magic[8] = {'B','L','C','T','R','L','0','1'};
+    bytes.insert(bytes.end(), magic, magic + sizeof(magic));
+    appendSaveU32(bytes, 1u);
+    appendSaveU32(bytes, (unsigned int)gFireKey);
+    appendSaveU32(bytes, (unsigned int)gActivateKey);
+    appendSaveU32(bytes, (unsigned int)gWeaponKey);
+    appendSaveU32(bytes, (unsigned int)gRunKey);
+    appendSaveU32(bytes, (unsigned int)gMenuKey);
+    appendSaveU32(bytes, fnv1aUpdate(2166136261u, &bytes[0], bytes.size()));
+
+    const std::string temporaryPath = path + ".tmp";
+    FILE* file = fopen(temporaryPath.c_str(), "wb");
+    if (!file) return false;
+    const bool written = fwrite(&bytes[0], 1, bytes.size(), file) == bytes.size() && fflush(file) == 0;
+    const bool closed = fclose(file) == 0;
+    if (!written || !closed || rename(temporaryPath.c_str(), path.c_str()) != 0) {
+        remove(temporaryPath.c_str());
+        LOGE("could not commit controller bindings");
+        return false;
+    }
+    LOGI("controller bindings saved fire=%d activate=%d weapon=%d run=%d menu=%d",
+         gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey);
+    return true;
+}
+
+static bool loadControlBindings() {
+    std::lock_guard<std::mutex> saveLock(gControlSaveMutex);
+    const std::string path = controlSavePath();
+    FILE* file = path.empty() ? nullptr : fopen(path.c_str(), "rb");
+    if (!file) return false;
+    if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
+    const long length = ftell(file);
+    if (length != 36 || fseek(file, 0, SEEK_SET) != 0) { fclose(file); return false; }
+    std::vector<unsigned char> bytes((size_t)length);
+    const bool read = fread(&bytes[0], 1, bytes.size(), file) == bytes.size();
+    fclose(file);
+    static const unsigned char magic[8] = {'B','L','C','T','R','L','0','1'};
+    if (!read || memcmp(&bytes[0], magic, sizeof(magic)) != 0) return false;
+    size_t checksumOffset = bytes.size() - 4u;
+    bool ok = true;
+    const unsigned int storedChecksum = readSaveU32(bytes, checksumOffset, ok);
+    if (!ok || storedChecksum != fnv1aUpdate(2166136261u, &bytes[0], bytes.size() - 4u)) return false;
+    size_t offset = 8u;
+    if (readSaveU32(bytes, offset, ok) != 1u) return false;
+    const int bindings[5] = {
+        (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
+        (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
+        (int)readSaveU32(bytes, offset, ok)
+    };
+    for (int i = 0; i < 5; ++i) if (!validControllerBinding(bindings[i])) return false;
+    gFireKey = bindings[0];
+    gActivateKey = bindings[1];
+    gWeaponKey = bindings[2];
+    gRunKey = bindings[3];
+    gMenuKey = bindings[4];
+    LOGI("controller bindings loaded fire=%d activate=%d weapon=%d run=%d menu=%d",
+         gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey);
+    return true;
 }
 
 static void appendSaveF32(std::vector<unsigned char>& bytes, float value) {
@@ -2630,6 +2749,10 @@ static bool loadGameProgress() {
         gPlayerBobPhase = playerBobPhase; gPlayerBobOffset = playerBobOffset;
         gPlayerBaseZ = playerBaseZ; gPlayerTargetBaseZ = playerTargetBaseZ;
         gPlayerCeilZ = playerCeilZ; gPlayerEyeZ = playerEyeZ;
+        // gPlayerEyeZ already contains the saved walking bob; keep the smooth
+        // base eye separate so the loaded bob is not applied twice.
+        gPlayerCameraEyeZF = (float)playerEyeZ - playerBobOffset;
+        gPlayerCameraVerticalSpeed = 0.0f;
         gPlayerLastCellX = playerLastCellX; gPlayerLastCellY = playerLastCellY;
         gPlayerLastBlockIndex = playerLastBlockIndex; gPlayerFallStartZ = playerFallStartZ;
         gPlayerFalling = (playerFlags & 1u) != 0u;
@@ -2755,7 +2878,8 @@ static void scanGameData() {
     gPlayerProgressValid = false;
     gRestoreLevelCheckpoint = false;
     loadGameProgress();
-    LOGI("Breathless Android 0.6.11 dataPath=%s gldFiles=%d first=%s probe=%s save=%s", gDataPath.c_str(), gGldFiles, gFirstGldName.c_str(), gFirstGldProbeOk ? "OK" : "MISS", gPlayerProgressValid ? "loaded" : "new");
+    const bool controlsLoaded = loadControlBindings();
+    LOGI("Breathless Android 0.7.5 dataPath=%s gldFiles=%d first=%s probe=%s save=%s controls=%s", gDataPath.c_str(), gGldFiles, gFirstGldName.c_str(), gFirstGldProbeOk ? "OK" : "MISS", gPlayerProgressValid ? "loaded" : "new", controlsLoaded ? "loaded" : "defaults");
 }
 
 static void ensureGl() {
@@ -2959,7 +3083,7 @@ static bool clearObjectLine(float x0, float y0, float x1, float y1) {
 static bool enemyCanOccupy(float x, float y, int height, int previousFloor, float radius) {
     static const float hull[9][2] = {
         {0.0f, 0.0f}, {-1.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, -1.0f}, {0.0f, 1.0f},
-        {-0.7071f, -0.7071f}, {0.7071f, -0.7071f}, {-0.7071f, 0.7071f}, {0.7071f, 0.7071f}
+        {-1.0f, -1.0f}, {1.0f, -1.0f}, {-1.0f, 1.0f}, {1.0f, 1.0f}
     };
     const int centerX = (int)floorf(x);
     const int centerY = (int)floorf(y);
@@ -2972,7 +3096,7 @@ static bool enemyCanOccupy(float x, float y, int height, int previousFloor, floa
         const LgldBlockInfo* block = currentLgldBlockForCell(mx, my);
         if (!block || block->ceilHeight - block->floorHeight < height) return false;
         if ((block->attributes & 8u) != 0u) return false;
-        if (block->floorHeight - previousFloor > ORIG_PLAYER_MAX_RISE) return false;
+        if (abs(block->floorHeight - previousFloor) > ORIG_PLAYER_MAX_RISE) return false;
     }
     return true;
 }
@@ -3114,6 +3238,7 @@ static void damageRuntimeEnemy(RuntimeObject& target, const GlobalObjectInfo& de
     target.alertClock = 8.0f;
     target.aiState = 0;
     if (target.health <= 0) {
+        stopSoundGroup(ENEMY_HIT_SOUND_GROUP_BASE + (int)target.placedIndex);
         target.health = 0;
         target.heading = projectileHeading;
         target.corpse = false;
@@ -3133,7 +3258,15 @@ static void damageRuntimeEnemy(RuntimeObject& target, const GlobalObjectInfo& de
             const int explosionCode = projectileForcesExplosion ? projectileDefinition->param[8] : definition.param[3];
             beginEnemyExplosion(target, definition, explosionCode);
         }
-    } else playSoundResource(definition.sound[1]);
+    } else {
+        const float pan = std::max(-1.0f, std::min(1.0f, (target.x - gPlayerX) / 6.0f));
+        // Objects.asm latches the hit sample per object (obj_subtype bit 7)
+        // until Paula has finished it. Only subtype bit 3 explicitly permits
+        // simultaneous sounds. Without that latch rapid hits stack loudly.
+        const bool simultaneous = (definition.param[9] & 8) != 0;
+        playSoundResource(definition.sound[1], pan,
+                          simultaneous ? 0 : ENEMY_HIT_SOUND_GROUP_BASE + (int)target.placedIndex);
+    }
 }
 
 static unsigned int projectileImpactColor(const GlobalObjectInfo& definition) {
@@ -3372,6 +3505,35 @@ static bool enemyCanMove(size_t movingIndex, float x, float y, int height, int p
     return true;
 }
 
+static float enemyCollisionRadius(const GlobalObjectInfo& definition) {
+    return (float)std::max(1, definition.radius) / 64.0f;
+}
+
+static bool recoverEnemyPosition(size_t movingIndex, RuntimeObject& runtime, int height,
+                                 int previousFloor, float radius) {
+    if (enemyCanOccupy(runtime.x, runtime.y, height, previousFloor, radius)) return true;
+    const float originalX = runtime.x;
+    const float originalY = runtime.y;
+    static const int directionCount = 32;
+    for (int ring = 1; ring <= 16; ++ring) {
+        const float distance = (float)ring / 16.0f;
+        for (int direction = 0; direction < directionCount; ++direction) {
+            const float angle = (float)direction * 6.28318530718f / (float)directionCount;
+            const float candidateX = originalX + cosf(angle) * distance;
+            const float candidateY = originalY + sinf(angle) * distance;
+            if (!clearObjectLine(originalX, originalY, candidateX, candidateY)) continue;
+            if (!enemyCanMove(movingIndex, candidateX, candidateY, height, previousFloor, radius)) continue;
+            runtime.x = candidateX;
+            runtime.y = candidateY;
+            runtime.collisionAttempts = 0;
+            LOGI("enemy wall recovery object=%u from=%.3f,%.3f to=%.3f,%.3f radius=%.3f",
+                 (unsigned int)runtime.placedIndex, originalX, originalY, candidateX, candidateY, radius);
+            return true;
+        }
+    }
+    return false;
+}
+
 static float normalizedAngleDifference(float target, float current) {
     return atan2f(sinf(target - current), cosf(target - current));
 }
@@ -3499,15 +3661,22 @@ static void updateRuntimeObjects() {
         runtime.bobPhase += dt * 4.0f;
         if (definition->numFrames > 1 && definition->animationType > 0)
             runtime.animationFrame = (int)(now * 10.0) % definition->numFrames;
-        const float dx = gPlayerX - runtime.x, dy = gPlayerY - runtime.y;
-        const float distance = sqrtf(dx * dx + dy * dy);
+        const float pickupDx = gPlayerX - runtime.x, pickupDy = gPlayerY - runtime.y;
+        const float pickupDistance = sqrtf(pickupDx * pickupDx + pickupDy * pickupDy);
         if (definition->objectType == 3u) {
-            if (!gPlayerDead && distance <= ((float)definition->radius + 18.0f) / 64.0f)
+            if (!gPlayerDead && pickupDistance <= ((float)definition->radius + 18.0f) / 64.0f)
                 collectRuntimePickup(runtime, *definition);
             continue;
         }
         if (definition->objectType != 2u) continue;
         if (placed.activationTrigger != 0u && gActiveEnemyTriggers.count(placed.activationTrigger) == 0u) continue;
+        const int enemyHeight = std::max(16, definition->height);
+        const LgldBlockInfo* oldBlock = currentLgldBlockForCell((int)runtime.x, (int)runtime.y);
+        const int oldFloor = oldBlock ? oldBlock->floorHeight : 0;
+        const float collisionRadius = enemyCollisionRadius(*definition);
+        recoverEnemyPosition(i, runtime, enemyHeight, oldFloor, collisionRadius);
+        const float dx = gPlayerX - runtime.x, dy = gPlayerY - runtime.y;
+        const float distance = sqrtf(dx * dx + dy * dy);
         runtime.contactClock = std::max(0.0f, runtime.contactClock - dt);
         runtime.stateClock -= dt;
         const float attackDistance = std::max(24, definition->param[0]) / 64.0f;
@@ -3585,20 +3754,17 @@ static void updateRuntimeObjects() {
         }
 
         const float speed = std::max(1, abs(definition->param[7])) * 25.0f / 64.0f;
-        const LgldBlockInfo* oldBlock = currentLgldBlockForCell((int)runtime.x, (int)runtime.y);
-        const int oldFloor = oldBlock ? oldBlock->floorHeight : 0;
         const float step = std::min(speed * dt, std::max(0.0f, distance - contactDistance));
         const float nx = runtime.x + cosf(runtime.heading) * step;
         const float ny = runtime.y + sinf(runtime.heading) * step;
-        const float collisionRadius = std::max(0.18f, std::min(0.42f, (float)definition->radius / 64.0f));
-        if (step > 0.0f && enemyCanMove(i, nx, ny, std::max(16, definition->height), oldFloor, collisionRadius)) {
+        if (step > 0.0f && enemyCanMove(i, nx, ny, enemyHeight, oldFloor, collisionRadius)) {
             runtime.x = nx;
             runtime.y = ny;
             runtime.collisionAttempts = 0;
         } else if (step > 0.0f) {
             const float cross = sinf(desiredHeading - runtime.heading);
             runtime.turnDirection = cross < 0.0f ? -1 : (cross > 0.0f ? 1 : (runtime.turnDirection == 0 ? 1 : -runtime.turnDirection));
-            chooseEnemyCollisionHeading(i, runtime, desiredHeading, std::max(16, definition->height),
+            chooseEnemyCollisionHeading(i, runtime, desiredHeading, enemyHeight,
                                         oldFloor, collisionRadius, step);
             runtime.aiState = 0;
             runtime.behaviorCounter = 5;
@@ -4039,6 +4205,8 @@ static void syncPlayerHeightFromCurrentCell(bool forceLog) {
         gPlayerBaseZ = 0;
         gPlayerBaseZF = 0.0f;
         gPlayerEyeZ = ORIG_PLAYER_EYES_HEIGHT;
+        gPlayerCameraEyeZF = (float)gPlayerEyeZ;
+        gPlayerCameraVerticalSpeed = 0.0f;
         return;
     }
     const int cx = (int)floorf(gPlayerX);
@@ -4053,9 +4221,11 @@ static void syncPlayerHeightFromCurrentCell(bool forceLog) {
         gPlayerBaseZF = (float)gPlayerTargetBaseZ;
         gPlayerVerticalSpeed = 0.0f;
         gPlayerFalling = false;
+        gPlayerCameraEyeZF = gPlayerBaseZF + (float)ORIG_PLAYER_EYES_HEIGHT;
+        gPlayerCameraVerticalSpeed = 0.0f;
     }
     gPlayerBaseZ = (int)floorf(gPlayerBaseZF + 0.5f);
-    gPlayerEyeZ = gPlayerBaseZ + ORIG_PLAYER_EYES_HEIGHT;
+    if (forceLog) gPlayerEyeZ = (int)floorf(gPlayerCameraEyeZF + 0.5f);
 
     const double t = nowSeconds();
     if (forceLog || cx != gPlayerLastCellX || cy != gPlayerLastCellY || bi != gPlayerLastBlockIndex || t - gPlayerHeightLastLog > 1.5) {
@@ -4288,6 +4458,7 @@ static void ensurePlayerInOpenCell() {
             gPlayerX = (float)x + 0.5f;
             gPlayerY = (float)y + 0.5f;
             gPlayerA = 0.0f;
+            syncPlayerHeightFromCurrentCell(true);
             LOGI("level walk v64 fallback spawn asset=%s cell=%d,%d", ai->name.c_str(), x, y);
             return;
         }
@@ -4307,9 +4478,39 @@ static void ensurePlayerInOpenCell() {
         if (!isWallCell((int)floorf(starts[i][0]), (int)floorf(starts[i][1]))) {
             gPlayerX = starts[i][0];
             gPlayerY = starts[i][1];
+            syncPlayerHeightFromCurrentCell(true);
             LOGI("player start corrected to open cell %.2f %.2f", gPlayerX, gPlayerY);
             return;
         }
+    }
+}
+
+static void updatePlayerCameraHeight(float targetEyeZ, float dt) {
+    const float difference = targetEyeZ - gPlayerCameraEyeZF;
+    if (fabsf(difference) <= 0.001f) {
+        gPlayerCameraEyeZF = targetEyeZ;
+        gPlayerCameraVerticalSpeed = 0.0f;
+        return;
+    }
+
+    const float wantedSpeed = difference > 0.0f
+        ? ORIG_PLAYER_VERTICAL_MAX_SPEED : -ORIG_PLAYER_VERTICAL_MAX_SPEED;
+    const float acceleration = ORIG_PLAYER_VERTICAL_ACCELERATION * dt;
+    if (gPlayerCameraVerticalSpeed < wantedSpeed) {
+        gPlayerCameraVerticalSpeed = std::min(wantedSpeed,
+            gPlayerCameraVerticalSpeed + acceleration);
+    } else if (gPlayerCameraVerticalSpeed > wantedSpeed) {
+        gPlayerCameraVerticalSpeed = std::max(wantedSpeed,
+            gPlayerCameraVerticalSpeed - acceleration);
+    }
+
+    const float nextEyeZ = gPlayerCameraEyeZF + gPlayerCameraVerticalSpeed * dt;
+    if ((difference > 0.0f && nextEyeZ >= targetEyeZ) ||
+        (difference < 0.0f && nextEyeZ <= targetEyeZ)) {
+        gPlayerCameraEyeZF = targetEyeZ;
+        gPlayerCameraVerticalSpeed = 0.0f;
+    } else {
+        gPlayerCameraEyeZF = nextEyeZ;
     }
 }
 
@@ -4386,7 +4587,8 @@ static void updatePlayerMotion() {
         gPlayerVerticalSpeed = 0.0f;
     }
     if (gPlayerFalling) {
-        gPlayerVerticalSpeed = std::min(500.0f, gPlayerVerticalSpeed + 1250.0f * (float)dt);
+        gPlayerVerticalSpeed = std::min(ORIG_PLAYER_VERTICAL_MAX_SPEED,
+            gPlayerVerticalSpeed + ORIG_PLAYER_VERTICAL_ACCELERATION * (float)dt);
         gPlayerBaseZF -= gPlayerVerticalSpeed * (float)dt;
         if (gPlayerBaseZF <= (float)newFloor) {
             gPlayerBaseZF = (float)newFloor;
@@ -4408,6 +4610,8 @@ static void updatePlayerMotion() {
             else if (gPlayerDeathWaitTicks > 0) --gPlayerDeathWaitTicks;
         }
         gPlayerEyeZ = gPlayerBaseZ + gPlayerDeathEyeHeight;
+        gPlayerCameraEyeZF = (float)gPlayerEyeZ;
+        gPlayerCameraVerticalSpeed = 0.0f;
         if (!gPlayerFalling && gPlayerDeathEyeHeight <= 12 && gPlayerDeathWaitTicks <= 0) {
             --gPlayerRetries;
             gRestoreLevelCheckpoint = true;
@@ -4434,8 +4638,17 @@ static void updatePlayerMotion() {
             return;
         }
     } else {
-        gPlayerEyeZ = gPlayerBaseZ + ORIG_PLAYER_EYES_HEIGHT +
-            (int)floorf(gPlayerBobOffset + (gPlayerBobOffset >= 0.0f ? 0.5f : -0.5f));
+        const float targetEyeZ = gPlayerBaseZF + (float)ORIG_PLAYER_EYES_HEIGHT;
+        if (gPlayerFalling) {
+            // Falling already follows the original accelerated vertical path;
+            // a second interpolation would make the camera lag twice.
+            gPlayerCameraEyeZF = targetEyeZ;
+            gPlayerCameraVerticalSpeed = 0.0f;
+        } else {
+            updatePlayerCameraHeight(targetEyeZ, (float)dt);
+        }
+        const float visibleEyeZ = gPlayerCameraEyeZF + gPlayerBobOffset;
+        gPlayerEyeZ = (int)floorf(visibleEyeZ + (visibleEyeZ >= 0.0f ? 0.5f : -0.5f));
     }
 
     if (!gPlayerDead && changedCell) {
@@ -4783,7 +4996,12 @@ static void drawSkyBackground() {
     // Keep this isolated from wall/floor texture binding so only sky pan behaviour changes.
     for (int y = 0; y < VIEW_CENTER_Y; ++y) for (int x = 0; x < FB_W; ++x) {
         if (gSkyTex.ok) {
-            const int sx = (int)((x * (int)gSkyTex.width) / FB_W + (int)(gPlayerA * SKY_SCROLL_SCALE_V33));
+            // Preserve the established 16:9 angular scale in the centre and
+            // reveal more wrapped sky on wider framebuffers. Dividing by the
+            // dynamic width would stretch one sky panorama over every aspect.
+            const int centeredX = x - (FB_W - BASE_FB_W) / 2;
+            const int sx = (int)((centeredX * (int)gSkyTex.width) / BASE_FB_W +
+                                 (int)(gPlayerA * SKY_SCROLL_SCALE_V33));
             int sy = (int)((y * (int)gSkyTex.height * SKY_VERTICAL_SCALE_V33) / VIEW_CENTER_Y);
             if (sy < 0) sy = 0;
             if (sy >= (int)gSkyTex.height) sy = (int)gSkyTex.height - 1;
@@ -6324,6 +6542,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
 
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeSaveProgress(JNIEnv*, jclass) {
     if (gPlayerProgressValid && !gPlayerDead) saveGameProgress();
+    saveControlBindings();
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRenderer_nativeSurfaceCreated(JNIEnv*, jclass) {
@@ -6340,12 +6559,38 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
     gUvScaleLoc = -1;
 }
 
+static void resizeGameFramebufferForView(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    const float screenAspect = (float)width / (float)height;
+    int wantedWidth = (int)floorf((float)FB_H * screenAspect + 0.5f);
+    wantedWidth = std::max(BASE_FB_W, std::min(MAX_FB_W, wantedWidth));
+    if ((wantedWidth & 1) != 0) ++wantedWidth;
+    if (wantedWidth == FB_W) return;
+
+    FB_W = wantedWidth;
+    HUD_X = (FB_W - ORIGINAL_W) / 2;
+    gFramebuffer.assign((size_t)FB_W * FB_H, 0xff000000u);
+    gPauseBackground.assign((size_t)FB_W * FB_H, 0xff000000u);
+    {
+        std::lock_guard<std::mutex> lock(gGameSnapshotMutex);
+        gLastGameFramebuffer.assign((size_t)FB_W * FB_H, 0xff000000u);
+        gHaveGameSnapshot = false;
+    }
+    gWallDepth.assign((size_t)FB_W * FB_H, 1.0e30f);
+    gRuntimeTerminalBackground.clear();
+    gOrigSpans.clear();
+    gTextureWidth = 0;
+    gTextureHeight = 0;
+    LOGI("game framebuffer resized to %dx%d for surface %dx%d aspect=%.3f",
+         FB_W, FB_H, width, height, (double)screenAspect);
+}
+
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRenderer_nativeInit(JNIEnv*, jclass, jint width, jint height) {
-    gViewW = width; gViewH = height; ensureGl();
+    gViewW = width; gViewH = height; resizeGameFramebufferForView(width, height); ensureGl();
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRenderer_nativeResize(JNIEnv*, jclass, jint width, jint height) {
-    gViewW = width; gViewH = height; glViewport(0, 0, gViewW, gViewH);
+    gViewW = width; gViewH = height; resizeGameFramebufferForView(width, height); glViewport(0, 0, gViewW, gViewH);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRenderer_nativeRender(JNIEnv*, jclass) {
@@ -6380,8 +6625,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
         glUniform2f(gScaleLoc, scaleX, scaleY);
         glUniform2f(gUvScaleLoc, 1.0f, 1.0f);
     } else {
-        // Keep the original aspect in the centre, but fill wider/taller displays
-        // by repeating the outermost pixel row/column instead of black bars.
+        // Presentation graphics keep their original aspect and repeat the
+        // outermost pixel row/column.  During gameplay the logical framebuffer
+        // already follows the physical display aspect, so this scale normally
+        // resolves to 1:1 without repeated side columns.
         glUniform2f(gScaleLoc, 1.0f, 1.0f);
         glUniform2f(gUvScaleLoc, scaleX, scaleY);
     }
@@ -6433,6 +6680,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
             else if (gControlCapture == 2) gWeaponKey = keyCode;
             else if (gControlCapture == 3) gRunKey = keyCode;
             else if (gControlCapture == 4) gMenuKey = keyCode;
+            saveControlBindings();
         }
         gControlCapture = -1;
         return;
@@ -6625,8 +6873,31 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
     }
 }
 
+static void mapTouchToRenderedContent(float screenX, float screenY, int contentWidth,
+                                      int contentHeight, float& contentX, float& contentY) {
+    const float contentAspect = (float)contentWidth / (float)contentHeight;
+    const float screenAspect = gViewH > 0 ? (float)gViewW / (float)gViewH : contentAspect;
+    float uvScaleX = 1.0f;
+    float uvScaleY = 1.0f;
+    if (screenAspect > contentAspect) uvScaleX = contentAspect / screenAspect;
+    else uvScaleY = screenAspect / contentAspect;
+    const float normalizedX = gViewW > 0 ? screenX / (float)gViewW : 0.5f;
+    const float normalizedY = gViewH > 0 ? screenY / (float)gViewH : 0.5f;
+    contentX = ((normalizedX - 0.5f) / uvScaleX + 0.5f) * (float)contentWidth;
+    contentY = ((normalizedY - 0.5f) / uvScaleY + 0.5f) * (float)contentHeight;
+    contentX = std::max(0.0f, std::min((float)contentWidth, contentX));
+    contentY = std::max(0.0f, std::min((float)contentHeight, contentY));
+}
+
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeTouch(JNIEnv*, jclass, jfloat x, jfloat y, jint action) {
     if (action != 1) return; // ACTION_UP
+    const bool presentation = gFrontendState != FRONTEND_GAME && gFrontendState != FRONTEND_PAUSE &&
+                              gFrontendState != FRONTEND_TERMINAL;
+    const int contentWidth = presentation ? ORIGINAL_W : FB_W;
+    const int contentHeight = presentation ? PRESENTATION_H : FB_H;
+    float virtualX = 0.0f;
+    float virtualY = 0.0f;
+    mapTouchToRenderedContent(x, y, contentWidth, contentHeight, virtualX, virtualY);
     if (gFrontendState == FRONTEND_LOGO1 || gFrontendState == FRONTEND_LOGO2) {
         setFrontendState(FRONTEND_TITLE);
     } else if (gFrontendState == FRONTEND_TITLE) {
@@ -6634,7 +6905,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
     } else if (gFrontendState == FRONTEND_CREDITS) {
         setFrontendState(FRONTEND_MENU);
     } else if (gFrontendState == FRONTEND_GAME_OPTIONS) {
-        const float virtualY = gViewH > 0 ? y * (float)PRESENTATION_H / (float)gViewH : y;
         if (virtualY >= 154.0f && virtualY < 180.0f) resetSavedGame();
         else setFrontendState(FRONTEND_MENU);
     } else if (gFrontendState == FRONTEND_LOADING) {
@@ -6643,7 +6913,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         gMoveLastTime = nowSeconds();
         setFrontendState(FRONTEND_GAME);
     } else if (gFrontendState == FRONTEND_MENU) {
-        const float virtualY = gViewH > 0 ? y * (float)PRESENTATION_H / (float)gViewH : y;
         if (virtualY >= 91.0f && virtualY < 182.0f) {
             gFrontendMenuSelection = std::max(0, std::min(5, (int)((virtualY - 91.0f) / 14.0f)));
             if (gFrontendMenuSelection == 0) startOrContinueGame();
@@ -6656,7 +6925,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
     } else if (gFrontendState == FRONTEND_SOUND || gFrontendState == FRONTEND_CONTROLS) {
         setFrontendState(FRONTEND_MENU);
     } else if (gFrontendState == FRONTEND_PAUSE) {
-        const float virtualY = gViewH > 0 ? y * (float)FB_H / (float)gViewH : y;
         if (virtualY >= 71.0f && virtualY < 113.0f) {
             gPauseMenuSelection = std::max(0, std::min(2, (int)((virtualY - 71.0f) / 14.0f)));
             if (gPauseMenuSelection == 0) setFrontendState(FRONTEND_GAME);
@@ -6674,7 +6942,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         closeRuntimeTerminal();
     } else if (gFrontendState == FRONTEND_GAME) {
         if (gPlayerDead || gLevelExitActive) return;
-        const float virtualX = gViewW > 0 ? x * (float)FB_W / (float)gViewW : x;
         if (virtualX >= FB_W * 0.5f) playerFireWeapon();
         else activateSwitchInFront();
     }

@@ -1,0 +1,4 @@
+# ninja log v5
+0	2316	809366334	CMakeFiles/breathless_native.dir/breathless_native.cpp.o	9f3b01af7634edef
+2318	2543	809366335	E:/Development/Android/Breathless/BreathlessAndroid/app/build/intermediates/cmake/debug/obj/arm64-v8a/libbreathless_native.so	55087778ff378c95
+0	9	0	clean	9bd345c9e703e127

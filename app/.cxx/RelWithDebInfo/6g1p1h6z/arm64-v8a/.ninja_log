@@ -1,0 +1,17 @@
+# ninja log v5
+1	9616	809367717	CMakeFiles/breathless_native.dir/breathless_native.cpp.o	1e311ea58112b9bd
+9617	10059	809367718	E:/Development/Android/Breathless/BreathlessAndroid/app/build/intermediates/cxx/RelWithDebInfo/6g1p1h6z/obj/arm64-v8a/libbreathless_native.so	c56e9a7dfd4114b1
+0	8	0	clean	ef8a912fbf324e8
+3	7716	809368496	CMakeFiles/breathless_native.dir/breathless_native.cpp.o	1e311ea58112b9bd
+7716	7820	809368496	E:/Development/Android/Breathless/BreathlessAndroid/app/build/intermediates/cxx/RelWithDebInfo/6g1p1h6z/obj/arm64-v8a/libbreathless_native.so	c56e9a7dfd4114b1
+0	10	0	clean	ef8a912fbf324e8
+0	7	0	clean	ef8a912fbf324e8
+2	7436	809369443	CMakeFiles/breathless_native.dir/breathless_native.cpp.o	1e311ea58112b9bd
+7436	7554	809369443	E:/Development/Android/Breathless/BreathlessAndroid/app/build/intermediates/cxx/RelWithDebInfo/6g1p1h6z/obj/arm64-v8a/libbreathless_native.so	c56e9a7dfd4114b1
+0	11	0	clean	ef8a912fbf324e8
+2	7676	809373259	CMakeFiles/breathless_native.dir/breathless_native.cpp.o	1e311ea58112b9bd
+7676	7780	809373259	E:/Development/Android/Breathless/BreathlessAndroid/app/build/intermediates/cxx/RelWithDebInfo/6g1p1h6z/obj/arm64-v8a/libbreathless_native.so	c56e9a7dfd4114b1
+0	9	0	clean	ef8a912fbf324e8
+2	7696	809378332	CMakeFiles/breathless_native.dir/breathless_native.cpp.o	1e311ea58112b9bd
+7696	7798	809378332	E:/Development/Android/Breathless/BreathlessAndroid/app/build/intermediates/cxx/RelWithDebInfo/6g1p1h6z/obj/arm64-v8a/libbreathless_native.so	c56e9a7dfd4114b1
+0	8	0	clean	ef8a912fbf324e8

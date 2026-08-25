@@ -1,0 +1,7 @@
+[
+{
+  "directory": "E:/Development/Android/Breathless/BreathlessAndroid/app/.cxx/Debug/4c5w4n45/arm64-v8a",
+  "command": "C:\\Users\\andiw\\AppData\\Local\\Android\\Sdk\\ndk\\23.1.7779620\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\clang++.exe --target=aarch64-none-linux-android28 --gcc-toolchain=C:/Users/andiw/AppData/Local/Android/Sdk/ndk/23.1.7779620/toolchains/llvm/prebuilt/windows-x86_64 --sysroot=C:/Users/andiw/AppData/Local/Android/Sdk/ndk/23.1.7779620/toolchains/llvm/prebuilt/windows-x86_64/sysroot -Dbreathless_native_EXPORTS -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++11 -Wall -Wextra -Wno-unused-parameter -fno-limit-debug-info  -fPIC -o CMakeFiles\\breathless_native.dir\\breathless_native.cpp.o -c E:\\Development\\Android\\Breathless\\BreathlessAndroid\\app\\src\\main\\cpp\\breathless_native.cpp",
+  "file": "E:\\Development\\Android\\Breathless\\BreathlessAndroid\\app\\src\\main\\cpp\\breathless_native.cpp"
+}
+]

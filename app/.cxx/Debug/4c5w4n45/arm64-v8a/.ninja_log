@@ -1,0 +1,16 @@
+# ninja log v5
+0	8	0	clean	ef8a912fbf324e8
+0	9	0	clean	ef8a912fbf324e8
+0	8	0	clean	ef8a912fbf324e8
+1	2195	809368981	CMakeFiles/breathless_native.dir/breathless_native.cpp.o	a1117cbf4f6d97ae
+2197	2306	809368981	E:/Development/Android/Breathless/BreathlessAndroid/app/build/intermediates/cxx/Debug/4c5w4n45/obj/arm64-v8a/libbreathless_native.so	c4abb49d17f1b01f
+1	9	0	clean	ef8a912fbf324e8
+2	2116	809369353	CMakeFiles/breathless_native.dir/breathless_native.cpp.o	a1117cbf4f6d97ae
+2116	2221	809369353	E:/Development/Android/Breathless/BreathlessAndroid/app/build/intermediates/cxx/Debug/4c5w4n45/obj/arm64-v8a/libbreathless_native.so	c4abb49d17f1b01f
+0	9	0	clean	ef8a912fbf324e8
+4	2156	809373205	CMakeFiles/breathless_native.dir/breathless_native.cpp.o	a1117cbf4f6d97ae
+2156	2268	809373205	E:/Development/Android/Breathless/BreathlessAndroid/app/build/intermediates/cxx/Debug/4c5w4n45/obj/arm64-v8a/libbreathless_native.so	c4abb49d17f1b01f
+0	10	0	clean	ef8a912fbf324e8
+1	2104	809378292	CMakeFiles/breathless_native.dir/breathless_native.cpp.o	a1117cbf4f6d97ae
+2104	2216	809378292	E:/Development/Android/Breathless/BreathlessAndroid/app/build/intermediates/cxx/Debug/4c5w4n45/obj/arm64-v8a/libbreathless_native.so	c4abb49d17f1b01f
+0	9	0	clean	ef8a912fbf324e8

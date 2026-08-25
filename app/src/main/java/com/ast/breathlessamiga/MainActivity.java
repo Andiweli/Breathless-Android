@@ -7,9 +7,6 @@ import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Window;
-import android.view.View;
-import android.view.WindowManager;
-import android.content.pm.ActivityInfo;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
@@ -54,10 +51,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
-        getWindow().setFlags(
-                WindowManager.LayoutParams.FLAG_FULLSCREEN | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
-                WindowManager.LayoutParams.FLAG_FULLSCREEN | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+        PlatformUi.configureWindow(this);
         applyGameUi();
 
         File dataDir = new File(getExternalFilesDir(null), "Breathless");
@@ -65,7 +59,14 @@ public class MainActivity extends Activity {
         nativeSetDataPath(dataDir.getAbsolutePath());
 
         glView = new BreathlessView(this);
-        setContentView(glView);
+        setContentView(PlatformUi.wrapContent(this, glView));
+        PlatformUi.installSystemUiRestorer(this);
+        glView.post(new Runnable() {
+            @Override public void run() {
+                applyGameUi();
+                glView.requestFocus();
+            }
+        });
     }
 
     @Override
@@ -82,10 +83,10 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
-        saveProgressOnRenderThread();
         stopAudio();
         stopMusic();
         nativeAnalog(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        saveProgressOnRenderThread();
         if (glView != null) glView.onPause();
         super.onPause();
     }
@@ -191,13 +192,7 @@ public class MainActivity extends Activity {
     }
 
     private void applyGameUi() {
-        getWindow().getDecorView().setSystemUiVisibility(
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
-                View.SYSTEM_UI_FLAG_FULLSCREEN |
-                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
-                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
-                View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        PlatformUi.applySystemUi(this);
     }
 
     @Override
@@ -222,7 +217,13 @@ public class MainActivity extends Activity {
 
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
-        nativeTouch(event.getX(), event.getY(), event.getActionMasked());
+        float localX = event.getX();
+        float localY = event.getY();
+        if (glView != null) {
+            localX = Math.max(0.0f, Math.min(glView.getWidth(), localX - glView.getLeft()));
+            localY = Math.max(0.0f, Math.min(glView.getHeight(), localY - glView.getTop()));
+        }
+        nativeTouch(localX, localY, event.getActionMasked());
         if (event.getActionMasked() == MotionEvent.ACTION_UP) {
             updateMusic();
             if (nativeConsumeQuitRequest()) finish();
