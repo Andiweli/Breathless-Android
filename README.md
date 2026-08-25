@@ -4,28 +4,25 @@
 
 A native Android port of **Breathless**, the 1995 Commodore Amiga first-person shooter, for OUYA and Android devices with equipped Gamepad.
 
-![OUYA](https://img.shields.io/badge/OUYA-Android%204.1%2B-green)
-![Android Automotive](https://img.shields.io/badge/Android%20Automotive-Android%209%2B-green)
-![Architecture](https://img.shields.io/badge/ABIs-ARMv7%20%7C%20ARM64%20%7C%20x86__64-orange)
-![Controller](https://img.shields.io/badge/Controls-Gamepad-blueviolet)
+![Android](https://img.shields.io/badge/OS-Android%204.1%2B-green)
+![Architecture](https://img.shields.io/badge/architecture-ARMv7%20%7C%20ARM64-orange)
+![Controller](https://img.shields.io/badge/controls-Gamepad-blueviolet)
 [![Support via PayPal](https://img.shields.io/badge/Support%20via-PayPal-0070BA?logo=paypal&logoColor=white)](https://paypal.me/andiweli)
 
 ## About the Breathless Android Port
 
 **Breathless** is a science-fiction first-person shooter originally released for the Commodore Amiga in 1995 by Fields of Vision. Explore hostile environments, fight enemies, collect weapons and supplies, and find your way through interconnected levels filled with doors, lifts, switches and secrets.
 
-This native Android port preserves the look, levels, gameplay and atmosphere of the Amiga original. It provides dedicated builds for OUYA and Android Automotive, and the Android project and port source code are available in this repository.
+This native Android port preserves the look, levels, gameplay and atmosphere of the Amiga original. It provides dedicated builds for OUYA and modern Android devices.
 
 ## Install Breathless on Android
 
 Download the appropriate APK for your platform or build one with Android Studio, then install it with Android's package installer. If required, allow installation from the app used to open the APK.
 
-- **OUYA:** Android 4.1 or newer, ARMv7
-- **Android Automotive:** Android 9 or newer, ARM64 or x86_64
-
 ## Planned Features
 
 - Touch input support
+- Some render effects like blob shadows
 
 ## Legal Notice
 
