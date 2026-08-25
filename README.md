@@ -1,29 +1,33 @@
-<img width="2172" height="724" alt="Breathless" src="https://github.com/user-attachments/assets/a4eb18dd-1eb3-44f9-8b15-a0c0ed738f0f" />
+<img width="2172" height="724" alt="Breathless Android port logo – Commodore Amiga first-person shooter" src="https://github.com/user-attachments/assets/a4eb18dd-1eb3-44f9-8b15-a0c0ed738f0f" />
 
-# Breathless Android
+# Breathless for Android – Amiga FPS Port
 
-![OS](https://img.shields.io/badge/up%20to-Android%2016-green)
-![Architecture](https://img.shields.io/badge/architecture-32/64bit-orange.svg)
+A native Android port of **Breathless**, the 1995 Commodore Amiga first-person shooter, for OUYA and Android Automotive devices.
+
+![OUYA](https://img.shields.io/badge/OUYA-Android%204.1%2B-green)
+![Android Automotive](https://img.shields.io/badge/Android%20Automotive-Android%209%2B-green)
+![Architecture](https://img.shields.io/badge/ABIs-ARMv7%20%7C%20ARM64%20%7C%20x86__64-orange)
 ![Controller](https://img.shields.io/badge/Controls-Gamepad-blueviolet)
-[![Support via PayPal](https://img.shields.io/badge/Support%20via-PayPal-0070BA?logo=paypal\&logoColor=white)](https://paypal.me/andiweli)
+[![Support via PayPal](https://img.shields.io/badge/Support%20via-PayPal-0070BA?logo=paypal&logoColor=white)](https://paypal.me/andiweli)
 
-## About
+## About the Breathless Android Port
 
-**Breathless** is a first-person shooter originally released for the Commodore Amiga in 1995 by Fields of Vision. Explore hostile science-fiction environments, fight enemies, collect weapons and supplies, and find your way through interconnected levels filled with doors, lifts, switches and secrets.
+**Breathless** is a science-fiction first-person shooter originally released for the Commodore Amiga in 1995 by Fields of Vision. Explore hostile environments, fight enemies, collect weapons and supplies, and find your way through interconnected levels filled with doors, lifts, switches and secrets.
 
-This project brings Breathless to Android as a native ARM port while preserving the look, levels, gameplay and atmosphere of the Amiga original. The Android project and port source code are available in this repository.
+This native Android port preserves the look, levels, gameplay and atmosphere of the Amiga original. It provides dedicated builds for OUYA and Android Automotive, and the Android project and port source code are available in this repository.
 
-## Installation
+## Install Breathless on Android
 
-Download a provided APK or build one with Android Studio, then install it with Android's package installer. If required, allow installation from the app used to open the APK.
+Download the appropriate APK for your platform or build one with Android Studio, then install it with Android's package installer. If required, allow installation from the app used to open the APK.
 
-Requires Android 4.1 or newer and an ARMv7 or ARM64 device.
+- **OUYA:** Android 4.1 or newer, ARMv7
+- **Android Automotive:** Android 9 or newer, ARM64 or x86_64
 
-## Planned
+## Planned Features
 
 - Touch input support
 
-## Legal
+## Legal Notice
 
 Breathless and its original game content are copyright their respective authors and rights holders, including Fields of Vision and Power Computing Ltd. This is an unofficial, non-commercial fan-made Android port and is not affiliated with or endorsed by the original rights holders.
 
