@@ -374,6 +374,7 @@ static void setFrontendState(FrontendState state);
 static void drawOriginalHud();
 static void selectLevelRelative(int direction, const char* source);
 static void applyGodModeLoadout();
+static void endGodModeSession(bool restorePlayerState);
 static void syncPlayerHeightFromCurrentCell(bool forceLog);
 static void beginTeleportTransition();
 static bool saveGameProgress();
@@ -387,10 +388,12 @@ static int gSoundMenuSelection = 0;
 static int gControlsMenuSelection = 0;
 static int gControlCapture = -1;
 static int gPauseMenuSelection = 0;
+static std::atomic<bool> gPauseBackgroundRefreshRequested(false);
 // Horizontal and vertical world sampling are selectable independently.
 // UI/HUD always remain pixel-exact.
 static int gRenderPixelSizeX = 1;
 static int gRenderPixelSizeY = 1;
+static bool gBlobShadowsEnabled = true;
 // Set by the Java launcher before game data/settings are loaded. This checks
 // the physical device identity, not the OUYA product flavor (which is also
 // used by modern handhelds such as Retroid).
@@ -415,6 +418,7 @@ static double gFireReleaseDeadline = 0.0;
 static const double AUTO_FIRE_INTERVAL = 0.40; // previous version: 2.5 shots/second
 static bool gGodMode = false;
 static bool gCheatShoulders[4] = {false, false, false, false};
+static bool gCheatDesktopKeys[4] = {false, false, false, false};
 static bool gCheatChordLatch = false;
 static double gGodModeMessageUntil = 0.0;
 static double gGameResetMessageUntil = 0.0;
@@ -495,6 +499,15 @@ static float gAnalogLX = 0.0f;
 static float gAnalogLY = 0.0f;
 static float gAnalogRX = 0.0f;
 static float gAnalogRY = 0.0f;
+// Physical keyboard state is kept separately from touch/controller axes so a
+// controller idle event cannot cancel a held WASD key on ChromeOS.
+static bool gKeyboardForward = false;
+static bool gKeyboardBackward = false;
+static bool gKeyboardStrafeLeft = false;
+static bool gKeyboardStrafeRight = false;
+static bool gKeyboardTurnLeft = false;
+static bool gKeyboardTurnRight = false;
+static bool gKeyboardRunHeld = false;
 static std::vector<unsigned char> gAutomapSeen(128u * 128u, 0u);
 static int gAutomapAssetIndex = -99999;
 static float gMapOriginX = 0.0f;
@@ -542,6 +555,19 @@ static int gCheckpointHealth = 100, gCheckpointShields = 100, gCheckpointEnergy 
 static int gCheckpointCredits = 0, gCheckpointScore = 0, gCheckpointWeapon = 0;
 static unsigned char gCheckpointWeapons[PLAYER_WEAPON_COUNT] = {1,0,0,0,0,0};
 static bool gCheckpointKeys[4] = {false,false,false,false};
+
+struct GodModeBaseline {
+    bool valid;
+    int health, shields, energy, weapon;
+    unsigned char weapons[PLAYER_WEAPON_COUNT];
+    int checkpointHealth, checkpointShields, checkpointEnergy, checkpointWeapon;
+    unsigned char checkpointWeapons[PLAYER_WEAPON_COUNT];
+};
+
+// GOD MODE is a session-only diagnostic aid.  The live player receives its
+// boosted loadout, while every persistent save continues to use this regular
+// pre-cheat state.
+static GodModeBaseline gGodModeBaseline = {};
 static std::vector<RuntimeObject> gRuntimeObjects;
 static std::vector<RuntimeProjectile> gRuntimeProjectiles;
 static std::vector<RuntimeImpactSpark> gRuntimeImpactSparks;
@@ -591,9 +617,32 @@ static int gRuntimeAssetIndex = -99999;
 static std::vector<LgldBlockInfo> gRuntimeBlocks;
 static std::vector<LgldBlockInfo> gInitialRuntimeBlocks;
 static std::vector<ActiveLevelEffect> gActiveEffects;
-static std::set<unsigned int> gPermanentEffectLists;
+// The original engine suppresses a completed effect by its trigger/effect
+// pair, not by the containing switch list. List-wide suppression breaks
+// mixed lists (for example a keyed door followed by enemy activation).
+static std::set<unsigned int> gPermanentEffectCommands;
 static std::set<unsigned int> gActiveEnemyTriggers;
 static std::set<unsigned int> gActivatedSwitchParts;
+
+static unsigned int effectCommandKey(const LgldEffectCommand& command) {
+    return (command.trigger << 8u) | (command.type & 0xffu);
+}
+
+static bool effectStopsPermanently(const LgldEffectCommand& command) {
+    if ((command.type >= 1u && command.type <= 4u) ||
+        command.type == 9u || command.type == 10u ||
+        command.type == 14u || command.type == 17u) return true;
+    return (command.type == 5u || command.type == 6u || command.type == 7u ||
+            command.type == 8u || command.type == 12u) && command.param2 == 0;
+}
+
+static bool permanentEffectForTrigger(unsigned int trigger) {
+    for (std::set<unsigned int>::const_iterator it = gPermanentEffectCommands.begin();
+         it != gPermanentEffectCommands.end(); ++it) {
+        if ((*it >> 8u) == trigger) return true;
+    }
+    return false;
+}
 // Nearest opaque world surface for sprite/object clipping. Plane distances are
 // stored here too; using wall-only depth allowed objects from lower sectors to
 // bleed through a nearer floor or door sill.
@@ -2334,7 +2383,7 @@ static bool saveControlBindings() {
     std::vector<unsigned char> bytes;
     static const unsigned char magic[8] = {'B','L','C','T','R','L','0','1'};
     bytes.insert(bytes.end(), magic, magic + sizeof(magic));
-    appendSaveU32(bytes, 5u);
+    appendSaveU32(bytes, 6u);
     appendSaveU32(bytes, (unsigned int)gFireKey);
     appendSaveU32(bytes, (unsigned int)gActivateKey);
     appendSaveU32(bytes, (unsigned int)gWeaponKey);
@@ -2343,6 +2392,7 @@ static bool saveControlBindings() {
     appendSaveU32(bytes, (unsigned int)gMapKey);
     appendSaveU32(bytes, (unsigned int)gRenderPixelSizeX);
     appendSaveU32(bytes, (unsigned int)gRenderPixelSizeY);
+    appendSaveU32(bytes, gBlobShadowsEnabled ? 1u : 0u);
     appendSaveU32(bytes, fnv1aUpdate(2166136261u, &bytes[0], bytes.size()));
 
     const std::string temporaryPath = path + ".tmp";
@@ -2355,10 +2405,10 @@ static bool saveControlBindings() {
         LOGE("could not commit controller bindings");
         return false;
     }
-    LOGI("controller/video settings saved fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d",
+    LOGI("controller/video settings saved fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d blobShadows=%s",
          gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey, gMapKey,
-         gRenderPixelSizeX, gRenderPixelSizeY);
-    gLoadedControlVersion = 5u;
+         gRenderPixelSizeX, gRenderPixelSizeY, gBlobShadowsEnabled ? "yes" : "no");
+    gLoadedControlVersion = 6u;
     return true;
 }
 
@@ -2369,7 +2419,7 @@ static bool loadControlBindings() {
     if (!file) return false;
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
     const long length = ftell(file);
-    if ((length != 36 && length != 40 && length != 44 && length != 48) ||
+    if ((length != 36 && length != 40 && length != 44 && length != 48 && length != 52) ||
         fseek(file, 0, SEEK_SET) != 0) { fclose(file); return false; }
     std::vector<unsigned char> bytes((size_t)length);
     const bool read = fread(&bytes[0], 1, bytes.size(), file) == bytes.size();
@@ -2383,10 +2433,11 @@ static bool loadControlBindings() {
     size_t offset = 8u;
     const unsigned int version = readSaveU32(bytes, offset, ok);
     if (!ok || (version != 1u && version != 2u && version != 3u &&
-                version != 4u && version != 5u)) return false;
+                version != 4u && version != 5u && version != 6u)) return false;
     if ((version == 1u && length != 36) || (version == 2u && length != 40) ||
         (version == 3u && length != 44) ||
-        ((version == 4u || version == 5u) && length != 48)) return false;
+        ((version == 4u || version == 5u) && length != 48) ||
+        (version == 6u && length != 52)) return false;
     const int bindings[5] = {
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
@@ -2415,9 +2466,15 @@ static bool loadControlBindings() {
         gRenderPixelSizeX = renderSizeX;
         gRenderPixelSizeY = renderSizeY;
     }
-    LOGI("controller/video settings loaded fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d version=%u",
+    gBlobShadowsEnabled = true;
+    if (version >= 6u) {
+        const unsigned int blobShadows = readSaveU32(bytes, offset, ok);
+        if (!ok || blobShadows > 1u) return false;
+        gBlobShadowsEnabled = blobShadows != 0u;
+    }
+    LOGI("controller/video settings loaded fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d blobShadows=%s version=%u",
          gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey, gMapKey,
-         gRenderPixelSizeX, gRenderPixelSizeY, version);
+         gRenderPixelSizeX, gRenderPixelSizeY, gBlobShadowsEnabled ? "yes" : "no", version);
     gLoadedControlVersion = version;
     return true;
 }
@@ -2487,30 +2544,50 @@ static bool saveGameProgress() {
         gRuntimeBlocks.size() == level.lgldBlockData.size() &&
         !gLevelExitActive && !gTeleportActive;
 
+    const bool saveRegularState = gGodMode && gGodModeBaseline.valid;
+    const int savedHealth = saveRegularState ? gGodModeBaseline.health : gPlayerHealth;
+    const int savedShields = saveRegularState ? gGodModeBaseline.shields : gPlayerShields;
+    const int savedEnergy = saveRegularState ? gGodModeBaseline.energy : gPlayerEnergy;
+    const int savedWeapon = saveRegularState ? gGodModeBaseline.weapon : gPlayerWeapon;
+    const unsigned char* savedWeapons = saveRegularState ?
+        gGodModeBaseline.weapons : gPlayerWeapons;
+    const int savedCheckpointHealth = saveRegularState ?
+        gGodModeBaseline.checkpointHealth : gCheckpointHealth;
+    const int savedCheckpointShields = saveRegularState ?
+        gGodModeBaseline.checkpointShields : gCheckpointShields;
+    const int savedCheckpointEnergy = saveRegularState ?
+        gGodModeBaseline.checkpointEnergy : gCheckpointEnergy;
+    const int savedCheckpointWeapon = saveRegularState ?
+        gGodModeBaseline.checkpointWeapon : gCheckpointWeapon;
+    const unsigned char* savedCheckpointWeapons = saveRegularState ?
+        gGodModeBaseline.checkpointWeapons : gCheckpointWeapons;
+
     std::vector<unsigned char> bytes;
     bytes.reserve(256u + (snapshotValid ? gRuntimeBlocks.size() * 12u + gRuntimeObjects.size() * 92u : 0u));
-    static const unsigned char magic[8] = {'B','L','S','A','V','E','0','2'};
+    static const unsigned char magic[8] = {'B','L','S','A','V','E','0','4'};
     bytes.insert(bytes.end(), magic, magic + sizeof(magic));
-    appendSaveU32(bytes, 2u);
+    appendSaveU32(bytes, 4u);
     appendSaveU32(bytes, snapshotValid ? 1u : 0u);
     appendSaveName(bytes, level.name, 16u);
-    appendSaveU32(bytes, (unsigned int)std::max(1, std::min(100, gPlayerHealth)));
-    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(100, gPlayerShields)));
-    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(9999, gPlayerEnergy)));
+    appendSaveU32(bytes, (unsigned int)std::max(1, std::min(100, savedHealth)));
+    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(100, savedShields)));
+    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(9999, savedEnergy)));
     appendSaveU32(bytes, (unsigned int)std::max(0, std::min(99999, gPlayerCredits)));
     appendSaveU32(bytes, (unsigned int)std::max(0, gPlayerScore));
-    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(PLAYER_WEAPON_COUNT - 1, gPlayerWeapon)));
+    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(PLAYER_WEAPON_COUNT - 1, savedWeapon)));
     appendSaveU32(bytes, (unsigned int)std::max(1, std::min(3, gPlayerRetries)));
-    for (int i = 0; i < PLAYER_WEAPON_COUNT; ++i) bytes.push_back((unsigned char)std::min(2, (int)gPlayerWeapons[i]));
+    for (int i = 0; i < PLAYER_WEAPON_COUNT; ++i)
+        bytes.push_back((unsigned char)std::min(2, (int)savedWeapons[i]));
     for (int i = 0; i < 4; ++i) bytes.push_back(gPlayerKeys[i] ? 1u : 0u);
 
-    appendSaveU32(bytes, (unsigned int)std::max(1, std::min(100, gCheckpointHealth)));
-    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(100, gCheckpointShields)));
-    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(9999, gCheckpointEnergy)));
+    appendSaveU32(bytes, (unsigned int)std::max(1, std::min(100, savedCheckpointHealth)));
+    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(100, savedCheckpointShields)));
+    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(9999, savedCheckpointEnergy)));
     appendSaveU32(bytes, (unsigned int)std::max(0, std::min(99999, gCheckpointCredits)));
     appendSaveU32(bytes, (unsigned int)std::max(0, gCheckpointScore));
-    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(PLAYER_WEAPON_COUNT - 1, gCheckpointWeapon)));
-    for (int i = 0; i < PLAYER_WEAPON_COUNT; ++i) bytes.push_back((unsigned char)std::min(2, (int)gCheckpointWeapons[i]));
+    appendSaveU32(bytes, (unsigned int)std::max(0, std::min(PLAYER_WEAPON_COUNT - 1, savedCheckpointWeapon)));
+    for (int i = 0; i < PLAYER_WEAPON_COUNT; ++i)
+        bytes.push_back((unsigned char)std::min(2, (int)savedCheckpointWeapons[i]));
     for (int i = 0; i < 4; ++i) bytes.push_back(gCheckpointKeys[i] ? 1u : 0u);
 
     if (snapshotValid) {
@@ -2579,7 +2656,7 @@ static bool saveGameProgress() {
         }
 
         const std::set<unsigned int>* sets[] = {
-            &gPermanentEffectLists, &gActiveEnemyTriggers, &gActivatedSwitchParts
+            &gPermanentEffectCommands, &gActiveEnemyTriggers, &gActivatedSwitchParts
         };
         for (size_t setIndex = 0; setIndex < sizeof(sets) / sizeof(sets[0]); ++setIndex) {
             appendSaveU32(bytes, (unsigned int)sets[setIndex]->size());
@@ -2622,9 +2699,14 @@ static bool loadGameProgress() {
     if (!read) return false;
     static const unsigned char magicV1[8] = {'B','L','S','A','V','E','0','1'};
     static const unsigned char magicV2[8] = {'B','L','S','A','V','E','0','2'};
+    static const unsigned char magicV3[8] = {'B','L','S','A','V','E','0','3'};
+    static const unsigned char magicV4[8] = {'B','L','S','A','V','E','0','4'};
     const bool legacyV1 = memcmp(&bytes[0], magicV1, sizeof(magicV1)) == 0;
-    const bool currentV2 = memcmp(&bytes[0], magicV2, sizeof(magicV2)) == 0;
-    if (!legacyV1 && !currentV2) return false;
+    const bool legacyV2 = memcmp(&bytes[0], magicV2, sizeof(magicV2)) == 0;
+    const bool currentV3 = memcmp(&bytes[0], magicV3, sizeof(magicV3)) == 0;
+    const bool currentV4 = memcmp(&bytes[0], magicV4, sizeof(magicV4)) == 0;
+    const bool snapshotFormat = legacyV2 || currentV3 || currentV4;
+    if (!legacyV1 && !snapshotFormat) return false;
     size_t checksumOffset = bytes.size() - 4u;
     bool ok = true;
     const unsigned int storedChecksum = readSaveU32(bytes, checksumOffset, ok);
@@ -2632,8 +2714,9 @@ static bool loadGameProgress() {
 
     size_t offset = 8u;
     const unsigned int version = readSaveU32(bytes, offset, ok);
-    if (!ok || (legacyV1 ? version != 1u : version != 2u)) return false;
-    const bool snapshotValid = currentV2 && (readSaveU32(bytes, offset, ok) & 1u) != 0u;
+    if (!ok || (legacyV1 ? version != 1u :
+                (legacyV2 ? version != 2u : (currentV3 ? version != 3u : version != 4u)))) return false;
+    const bool snapshotValid = snapshotFormat && (readSaveU32(bytes, offset, ok) & 1u) != 0u;
     const std::string levelName = readSaveName(bytes, offset, 16u, ok);
     const int health = (int)readSaveU32(bytes, offset, ok);
     const int shields = (int)readSaveU32(bytes, offset, ok);
@@ -2665,7 +2748,7 @@ static bool loadGameProgress() {
     bool checkpointKeys[4];
     memcpy(checkpointWeapons, weapons, sizeof(checkpointWeapons));
     memcpy(checkpointKeys, keys, sizeof(checkpointKeys));
-    if (currentV2) {
+    if (snapshotFormat) {
         checkpointHealth = (int)readSaveU32(bytes, offset, ok);
         checkpointShields = (int)readSaveU32(bytes, offset, ok);
         checkpointEnergy = (int)readSaveU32(bytes, offset, ok);
@@ -2685,6 +2768,16 @@ static bool loadGameProgress() {
             checkpointKeys[i] = bytes[offset++] != 0u;
         }
         if (checkpointWeapons[0] == 0u || checkpointWeapons[checkpointWeapon] == 0u) return false;
+    }
+
+    // Version 2 could retain keys across retries and level changes and could
+    // therefore claim that a still-visible key was already owned.  Clear only
+    // those legacy key flags once; version 3 then stores genuine in-level keys
+    // normally when the player quits and resumes.
+    if (legacyV2) {
+        memset(keys, 0, sizeof(keys));
+        memset(checkpointKeys, 0, sizeof(checkpointKeys));
+        LOGI("progress migration v2->v3 cleared stale key state");
     }
 
     int levelIndex = -1;
@@ -2791,6 +2884,24 @@ static bool loadGameProgress() {
             if (!ok || count > 65536u) return false;
             for (unsigned int i = 0; i < count; ++i) sets[setIndex]->insert(readSaveU32(bytes, offset, ok));
         }
+
+        // Versions 2 and 3 stored permanent state as a list number. Convert
+        // every permanently stopping command in those lists to the original
+        // trigger/effect identity used by version 4.
+        if (legacyV2 || currentV3) {
+            std::set<unsigned int> migratedCommands;
+            for (std::set<unsigned int>::const_iterator it = savedPermanentEffects.begin();
+                 it != savedPermanentEffects.end(); ++it) {
+                if (*it == 0u || *it > savedLevel.lgldEffectData.size()) continue;
+                const std::vector<LgldEffectCommand>& list = savedLevel.lgldEffectData[*it - 1u];
+                for (size_t commandIndex = 0; commandIndex < list.size(); ++commandIndex) {
+                    if (effectStopsPermanently(list[commandIndex]))
+                        migratedCommands.insert(effectCommandKey(list[commandIndex]));
+                }
+            }
+            savedPermanentEffects.swap(migratedCommands);
+            LOGI("progress migration v%u->v4 converted permanent effect identities", legacyV2 ? 2u : 3u);
+        }
     }
     if (!ok || offset + 4u != bytes.size()) return false;
 
@@ -2833,7 +2944,7 @@ static bool loadGameProgress() {
         gRuntimeBlocks.swap(savedBlocks);
         gRuntimeObjects.swap(savedObjects);
         gActiveEffects.swap(savedEffects);
-        gPermanentEffectLists.swap(savedPermanentEffects);
+        gPermanentEffectCommands.swap(savedPermanentEffects);
         gActiveEnemyTriggers.swap(savedEnemyTriggers);
         gActivatedSwitchParts.swap(savedSwitchParts);
         gRuntimeProjectiles.clear();
@@ -2850,10 +2961,13 @@ static bool loadGameProgress() {
     gTeleportActive = false;
     gRuntimeTerminalNumber = 0;
     gRuntimeTerminalBackground.clear();
-    gSaveDirty = false;
-    gLastProgressSaveTime = nowSeconds();
-    LOGI("progress loaded level=%s health=%d armor=%d credits=%d snapshot=%s objects=%u",
+    // Persist the one-time v2 key cleanup on the first rendered frame.
+    gSaveDirty = legacyV2 || currentV3;
+    gLastProgressSaveTime = (legacyV2 || currentV3) ? 0.0 : nowSeconds();
+    LOGI("progress loaded level=%s health=%d armor=%d credits=%d keys=%d%d%d%d snapshot=%s objects=%u",
          levelName.c_str(), gPlayerHealth, gPlayerShields, gPlayerCredits,
+         gPlayerKeys[0] ? 1 : 0, gPlayerKeys[1] ? 1 : 0,
+         gPlayerKeys[2] ? 1 : 0, gPlayerKeys[3] ? 1 : 0,
          snapshotValid ? "yes" : "no", snapshotValid ? (unsigned int)gRuntimeObjects.size() : 0u);
     return true;
 }
@@ -2868,7 +2982,7 @@ static void maybeAutosaveGameProgress() {
 }
 
 static void resetSavedGame() {
-    gGodMode = false;
+    endGodModeSession(false);
     gAssetIndex = firstPlayableLevelIndex();
     gPlayerHealth = 100;
     gPlayerShields = 100;
@@ -2898,7 +3012,7 @@ static void resetSavedGame() {
     gRuntimeImpactSparks.clear();
     gRuntimeImpactExplosions.clear();
     gActiveEffects.clear();
-    gPermanentEffectLists.clear();
+    gPermanentEffectCommands.clear();
     gActiveEnemyTriggers.clear();
     gActivatedSwitchParts.clear();
     gPlayerStartChecked = false;
@@ -2915,8 +3029,10 @@ static void resetSavedGame() {
 }
 
 static void startOrContinueGame() {
+    const bool restartGodModeAfterInitialization = gGodMode;
     if (!gPlayerProgressValid) {
         resetSavedGame();
+        if (restartGodModeAfterInitialization) applyGodModeLoadout();
     }
     gRestoreLevelCheckpoint = false;
     gPlayerStartChecked = gRuntimeAssetIndex == gAssetIndex &&
@@ -2926,6 +3042,10 @@ static void startOrContinueGame() {
 }
 
 static void scanGameData() {
+    // Android may recreate MainActivity inside the same process after QUIT.
+    // Native globals therefore have to be cleared explicitly; relying on the
+    // shared library being unloaded would let GOD MODE survive a relaunch.
+    endGodModeSession(true);
     resetGldProbe();
     DIR* dir = opendir(gDataPath.c_str());
     if (!dir) { gGldFiles = -1; LOGE("data dir missing: %s", gDataPath.c_str()); return; }
@@ -2965,7 +3085,7 @@ static void scanGameData() {
             LOGE("OUYA hardware detected: could not persist initial 2x2 render size");
         }
     }
-    LOGI("Breathless Android 1.0 dataPath=%s gldFiles=%d first=%s probe=%s save=%s controls=%s ouya=%s", gDataPath.c_str(), gGldFiles, gFirstGldName.c_str(), gFirstGldProbeOk ? "OK" : "MISS", gPlayerProgressValid ? "loaded" : "new", controlsLoaded ? "loaded" : "defaults", gOuyaDevice ? "yes" : "no");
+    LOGI("Breathless Android 1.1 dataPath=%s gldFiles=%d first=%s probe=%s save=%s controls=%s ouya=%s", gDataPath.c_str(), gGldFiles, gFirstGldName.c_str(), gFirstGldProbeOk ? "OK" : "MISS", gPlayerProgressValid ? "loaded" : "new", controlsLoaded ? "loaded" : "defaults", gOuyaDevice ? "yes" : "no");
 }
 
 static void ensureGl() {
@@ -3023,7 +3143,7 @@ static void ensureRuntimeLevelState() {
     gRuntimeBlocks = ai->lgldBlockData;
     gInitialRuntimeBlocks = ai->lgldBlockData;
     gActiveEffects.clear();
-    gPermanentEffectLists.clear();
+    gPermanentEffectCommands.clear();
     gActiveEnemyTriggers.clear();
     gActivatedSwitchParts.clear();
     const bool restoredCheckpoint = gRestoreLevelCheckpoint;
@@ -3048,6 +3168,10 @@ static void ensureRuntimeLevelState() {
         memcpy(gPlayerWeapons, gCheckpointWeapons, sizeof(gPlayerWeapons));
         memcpy(gPlayerKeys, gCheckpointKeys, sizeof(gPlayerKeys));
     }
+    // InitScores2 clears all four live keys whenever a level is initialized,
+    // including a retry.  A saved in-level snapshot bypasses this initializer
+    // and therefore still restores keys held at the moment the game was quit.
+    memset(gPlayerKeys, 0, sizeof(gPlayerKeys));
     gRestoreLevelCheckpoint = false;
     gPlayerDead = false;
     gPlayerDeathEyeHeight = ORIG_PLAYER_EYES_HEIGHT;
@@ -3094,7 +3218,17 @@ static void ensureRuntimeLevelState() {
     gPlayerFalling = false;
     gPlayerVerticalSpeed = 0.0f;
     gHazardClock = 0.0;
-    if (gGodMode) applyGodModeLoadout();
+    if (gGodMode) {
+        applyGodModeLoadout();
+        if (gGodModeBaseline.valid) {
+            gGodModeBaseline.checkpointHealth = gGodModeBaseline.health;
+            gGodModeBaseline.checkpointShields = gGodModeBaseline.shields;
+            gGodModeBaseline.checkpointEnergy = gGodModeBaseline.energy;
+            gGodModeBaseline.checkpointWeapon = gGodModeBaseline.weapon;
+            memcpy(gGodModeBaseline.checkpointWeapons, gGodModeBaseline.weapons,
+                   sizeof(gGodModeBaseline.checkpointWeapons));
+        }
+    }
     gCheckpointHealth = gPlayerHealth;
     gCheckpointShields = gPlayerShields;
     gCheckpointEnergy = gPlayerEnergy;
@@ -3102,7 +3236,7 @@ static void ensureRuntimeLevelState() {
     gCheckpointScore = gPlayerScore;
     gCheckpointWeapon = gPlayerWeapon;
     memcpy(gCheckpointWeapons, gPlayerWeapons, sizeof(gCheckpointWeapons));
-    memcpy(gCheckpointKeys, gPlayerKeys, sizeof(gCheckpointKeys));
+    memset(gCheckpointKeys, 0, sizeof(gCheckpointKeys));
     if (restoredCheckpoint) {
         markGameProgressDirty();
         saveGameProgress();
@@ -3275,6 +3409,21 @@ static void damagePlayer(int damage) {
 }
 
 static void applyGodModeLoadout() {
+    if (!gGodMode) {
+        gGodModeBaseline.valid = true;
+        gGodModeBaseline.health = gPlayerHealth;
+        gGodModeBaseline.shields = gPlayerShields;
+        gGodModeBaseline.energy = gPlayerEnergy;
+        gGodModeBaseline.weapon = gPlayerWeapon;
+        memcpy(gGodModeBaseline.weapons, gPlayerWeapons,
+               sizeof(gGodModeBaseline.weapons));
+        gGodModeBaseline.checkpointHealth = gCheckpointHealth;
+        gGodModeBaseline.checkpointShields = gCheckpointShields;
+        gGodModeBaseline.checkpointEnergy = gCheckpointEnergy;
+        gGodModeBaseline.checkpointWeapon = gCheckpointWeapon;
+        memcpy(gGodModeBaseline.checkpointWeapons, gCheckpointWeapons,
+               sizeof(gGodModeBaseline.checkpointWeapons));
+    }
     gGodMode = true;
     gPlayerHealth = 100;
     gPlayerShields = 100;
@@ -3282,6 +3431,28 @@ static void applyGodModeLoadout() {
     for (size_t i = 0; i < sizeof(gPlayerWeapons); ++i) gPlayerWeapons[i] = 2;
     gPlayerDead = false;
     markGameProgressDirty();
+}
+
+static void endGodModeSession(bool restorePlayerState) {
+    if (restorePlayerState && gGodModeBaseline.valid) {
+        gPlayerHealth = gGodModeBaseline.health;
+        gPlayerShields = gGodModeBaseline.shields;
+        gPlayerEnergy = gGodModeBaseline.energy;
+        gPlayerWeapon = gGodModeBaseline.weapon;
+        memcpy(gPlayerWeapons, gGodModeBaseline.weapons, sizeof(gPlayerWeapons));
+        gCheckpointHealth = gGodModeBaseline.checkpointHealth;
+        gCheckpointShields = gGodModeBaseline.checkpointShields;
+        gCheckpointEnergy = gGodModeBaseline.checkpointEnergy;
+        gCheckpointWeapon = gGodModeBaseline.checkpointWeapon;
+        memcpy(gCheckpointWeapons, gGodModeBaseline.checkpointWeapons,
+               sizeof(gCheckpointWeapons));
+    }
+    gGodMode = false;
+    gGodModeBaseline.valid = false;
+    gGodModeMessageUntil = 0.0;
+    memset(gCheatShoulders, 0, sizeof(gCheatShoulders));
+    memset(gCheatDesktopKeys, 0, sizeof(gCheatDesktopKeys));
+    gCheatChordLatch = false;
 }
 
 static void collectRuntimePickup(RuntimeObject& runtime, const GlobalObjectInfo& definition) {
@@ -3294,8 +3465,13 @@ static void collectRuntimePickup(RuntimeObject& runtime, const GlobalObjectInfo&
     else if (subtype == 3) { if (gPlayerCredits >= 99999) accepted = false; else { gPlayerCredits = std::min(99999, gPlayerCredits + value); gPickupMessage = "CREDITS"; } }
     else if (subtype >= 4 && subtype <= 7) {
         const int key = subtype - 4;
+        static const char* names[4] = {"GREEN KEY","YELLOW KEY","RED KEY","BLUE KEY"};
         if (gPlayerKeys[key]) accepted = false;
-        else { gPlayerKeys[key] = true; static const char* names[4] = {"GREEN KEY","YELLOW KEY","RED KEY","BLUE KEY"}; gPickupMessage = names[key]; }
+        else {
+            gPlayerKeys[key] = true;
+            gPickupMessage = names[key];
+            LOGI("pickup collected: %s", names[key]);
+        }
     }
     else if (subtype >= 8 && subtype < 8 + PLAYER_WEAPON_COUNT) {
         const int weapon = subtype - 8;
@@ -4056,40 +4232,76 @@ static int originalEdgeFaceForStep(int side, int stepX, int stepY);
 static bool activateEffectList(unsigned int listIndex) {
     const AssetInfo* ai = currentLgldAsset();
     if (!ai || listIndex == 0 || listIndex > ai->lgldEffectData.size()) return false;
-    if (gPermanentEffectLists.count(listIndex) != 0u) return false;
-    for (size_t i = 0; i < gActiveEffects.size(); ++i) {
-        if (!gActiveEffects[i].finished && gActiveEffects[i].listIndex == listIndex) {
-            LOGI("effect list %u ignored because it is already active", listIndex);
-            return false;
-        }
-    }
     const std::vector<LgldEffectCommand>& list = ai->lgldEffectData[listIndex - 1u];
-    bool oneShot = false;
-    std::set<unsigned int> startedDoorTriggers;
+    if (list.empty()) return false;
+
+    // The Amiga routine exits the complete switch operation as soon as a
+    // required key is missing. Preflight before creating any effect so later
+    // unkeyed commands cannot run behind a locked door.
     for (size_t i = 0; i < list.size(); ++i) {
         const LgldEffectCommand& c = list[i];
+        const unsigned int commandKey = effectCommandKey(c);
+        if (gPermanentEffectCommands.count(commandKey) != 0u) continue;
+        bool alreadyActive = false;
+        for (size_t activeIndex = 0; activeIndex < gActiveEffects.size(); ++activeIndex) {
+            const ActiveLevelEffect& active = gActiveEffects[activeIndex];
+            if (!active.finished && active.command.trigger == c.trigger && active.command.type == c.type) {
+                alreadyActive = true;
+                break;
+            }
+        }
+        if (alreadyActive) continue;
         if (c.key != 0u && (c.key > 4u || !gPlayerKeys[c.key - 1u])) {
             gPickupMessage = "KEY REQUIRED";
             gPickupMessageUntil = nowSeconds() + 1.5;
             playSoundResource("FAUL");
             LOGI("effect list %u blocked: missing key %u", listIndex, c.key);
-            continue;
+            return false;
         }
+    }
+
+    bool activatedAny = false;
+    unsigned int activatedCount = 0u;
+    bool usedKeys[4] = {false, false, false, false};
+    std::set<unsigned int> startedDoorTriggers;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const LgldEffectCommand& c = list[i];
+        const unsigned int commandKey = effectCommandKey(c);
+        if (gPermanentEffectCommands.count(commandKey) != 0u) continue;
+        bool alreadyActive = false;
+        for (size_t activeIndex = 0; activeIndex < gActiveEffects.size(); ++activeIndex) {
+            const ActiveLevelEffect& active = gActiveEffects[activeIndex];
+            if (!active.finished && active.command.trigger == c.trigger && active.command.type == c.type) {
+                alreadyActive = true;
+                break;
+            }
+        }
+        if (alreadyActive) continue;
+        if (c.key >= 1u && c.key <= 4u) usedKeys[c.key - 1u] = true;
         ActiveLevelEffect active;
         active.command = c;
         active.listIndex = listIndex;
-        active.remaining = (float)std::max(0, abs(c.param1));
+        // BlinkingLight has a fixed 50-tick initial delay in Animations.asm;
+        // its param1 is the absolute flash illumination, not a duration.
+        active.remaining = c.type == 16u ? 50.0f : (float)std::max(0, abs(c.param1));
         gActiveEffects.push_back(active);
+        activatedAny = true;
+        ++activatedCount;
         if (isDoorEffectType(c.type) && startedDoorTriggers.insert(c.trigger).second)
             playDoorSoundCode(0, c.trigger);
-        if ((c.type >= 1u && c.type <= 4u) || c.type == 9u || c.type == 10u ||
-            ((c.type == 5u || c.type == 6u || c.type == 7u || c.type == 8u || c.type == 12u) && c.param2 == 0)) {
-            oneShot = true;
-        }
+        if (effectStopsPermanently(c)) gPermanentEffectCommands.insert(commandKey);
     }
-    if (oneShot) gPermanentEffectLists.insert(listIndex);
-    LOGI("effect list activated list=%u commands=%u", listIndex, (unsigned int)list.size());
-    return !list.empty();
+    // movement.asm marks every accepted key command and removes the key after
+    // the complete trigger list has been processed.  Keeping keys forever made
+    // later pickups look broken and did not match the original game.
+    for (int key = 0; key < 4; ++key) {
+        if (!usedKeys[key]) continue;
+        gPlayerKeys[key] = false;
+        markGameProgressDirty();
+        LOGI("effect list %u consumed key %d", listIndex, key + 1);
+    }
+    LOGI("effect list activated list=%u commands=%u", listIndex, activatedCount);
+    return activatedAny;
 }
 
 static int runtimePlaneDelta(int blockIndex, bool ceilingPlane) {
@@ -4197,8 +4409,34 @@ static void updateRuntimeEffects(float dt) {
             continue;
         }
         if (type == 17u) {
+            // ActiveEnemy waits param1 ticks before waking the matching group.
+            // The Android path used to ignore this delay completely.
+            e.fractional += ticks;
+            const int elapsed = (int)e.fractional;
+            if (elapsed <= 0) continue;
+            e.fractional -= (float)elapsed;
+            e.remaining -= (float)elapsed;
+            if (e.remaining > 0.0f) continue;
             gActiveEnemyTriggers.insert(e.command.trigger);
             e.finished = true;
+            continue;
+        }
+        if (type == 9u || type == 10u) {
+            // LightUp/LightDown use param1 as the total illumination change
+            // and param2 as its duration in 50 Hz ticks. The former Android
+            // implementation changed one unit per tick and ignored param2.
+            const float total = (float)std::max(0, abs(e.command.param1));
+            if (total <= 0.0f) { e.finished = true; continue; }
+            const float duration = (float)std::max(1, abs(e.command.param2));
+            e.fractional += ticks * total / duration;
+            int lightStep = (int)e.fractional;
+            if (lightStep <= 0) continue;
+            e.fractional -= (float)lightStep;
+            lightStep = std::min(lightStep, std::max(0, (int)ceilf(e.remaining)));
+            if (lightStep <= 0) { e.finished = true; continue; }
+            mutateTriggeredBlocks(e.command.trigger, 0, 0, type == 9u ? -lightStep : lightStep);
+            e.remaining -= (float)lightStep;
+            if (e.remaining <= 0.0f) e.finished = true;
             continue;
         }
         if (type == 13u) {
@@ -4222,22 +4460,46 @@ static void updateRuntimeEffects(float dt) {
                 const int desiredDelta = -(int)floorf(travelled * (float)e.command.param1 / (float)total + 0.5f);
                 mutateTriggeredBlocks(e.command.trigger, 0, 0, desiredDelta - e.appliedLightDelta);
                 e.appliedLightDelta = desiredDelta;
-            } else if (gPermanentEffectLists.count(e.listIndex) == 0u) {
+            } else if (!permanentEffectForTrigger((unsigned int)e.command.param2)) {
                 mutateTriggeredBlocks(e.command.trigger, 0, 0, -e.appliedLightDelta);
                 e.appliedLightDelta = 0;
                 e.finished = true;
             } else {
+                gPermanentEffectCommands.insert(effectCommandKey(e.command));
                 e.finished = true; // keep the final light value for a permanent-open door
             }
             continue;
         }
         if (type == 16u) {
+            // Original BlinkingLight: wait 50 ticks initially, set the target
+            // blocks to the absolute param1 illumination for 10 ticks, restore
+            // them, then wait param2 ticks (or a random 0..150) and repeat.
             e.fractional += ticks;
-            const int period = e.command.param2 > 0 ? e.command.param2 : 25;
-            if ((int)e.fractional >= period) {
-                e.fractional -= (float)period;
-                e.phase ^= 1;
-                mutateTriggeredBlocks(e.command.trigger, 0, 0, e.phase ? e.command.param1 : -e.command.param1);
+            const int elapsed = (int)e.fractional;
+            if (elapsed <= 0) continue;
+            e.fractional -= (float)elapsed;
+            e.remaining -= (float)elapsed;
+            if (e.remaining > 0.0f) continue;
+            if (e.phase == 1) {
+                mutateTriggeredBlocks(e.command.trigger, 0, 0, -e.appliedLightDelta);
+                e.appliedLightDelta = 0;
+                e.phase = 2;
+                e.remaining = (float)(e.command.param2 > 0 ? e.command.param2 : rand() % 151);
+            } else {
+                int currentIllumination = 0;
+                bool foundTriggeredBlock = false;
+                for (size_t blockIndex = 1; blockIndex < gRuntimeBlocks.size(); ++blockIndex) {
+                    const LgldBlockInfo& block = gRuntimeBlocks[blockIndex];
+                    if (block.trigger == e.command.trigger || block.trigger2 == e.command.trigger) {
+                        currentIllumination = block.illumination;
+                        foundTriggeredBlock = true;
+                        break;
+                    }
+                }
+                e.appliedLightDelta = foundTriggeredBlock ? e.command.param1 - currentIllumination : 0;
+                mutateTriggeredBlocks(e.command.trigger, 0, 0, e.appliedLightDelta);
+                e.phase = 1;
+                e.remaining = 10.0f;
             }
             continue;
         }
@@ -4306,15 +4568,18 @@ static void activateSwitchInFront() {
     if (!target) return;
     const int face = originalEdgeFaceForStep(stepX != 0 ? 0 : 1, stepX, stepY);
     if ((target->attributes & (0x10u << face)) == 0u) return;
+    const bool hasEffect = target->effect != 0u;
+    if (hasEffect && !activateEffectList(target->effect)) return;
+
     int edgeIndex = target->edge[face];
     if (edgeIndex < 0) edgeIndex = -edgeIndex;
     if (edgeIndex > 0) {
-        // movement.asm replaces all three edge brushes with their linked ON
-        // texture before it activates the associated effect list.
+        // Change the visual only after a keyed list has been accepted. The
+        // original changes it earlier, which leaves a failed switch green.
         for (unsigned int part = 0; part < 3u; ++part)
             gActivatedSwitchParts.insert((unsigned int)edgeIndex * 3u + part);
     }
-    if (activateEffectList(target->effect)) playSoundResource("SWT1");
+    if (hasEffect) playSoundResource("SWT1");
 }
 
 static std::string lgldTextureDebugName(int idx) {
@@ -4552,7 +4817,19 @@ static bool canOccupyPositionV57(float x, float y, const char* axisLabel) {
             const float oldDy = currentCornerY - centerY;
             const float newDx = targetCornerX - centerX;
             const float newDy = targetCornerY - centerY;
-            if (newDx * newDx + newDy * newDy + 0.00001f < oldDx * oldDx + oldDy * oldDy) return false;
+
+            // Movement is resolved one axis at a time. Like movement.asm,
+            // reject only motion deeper into the blocking boundary and retain
+            // the other coordinate, so the player can slide along walls and
+            // high ledges. The former radial comparison also rejected parallel
+            // motion and could trap the player beside any rise over 24 units.
+            if (axisLabel && axisLabel[0] == 'X') {
+                if (targetCellX != targetCenterX && fabsf(newDx) + 0.00001f < fabsf(oldDx)) return false;
+            } else if (axisLabel && axisLabel[0] == 'Y') {
+                if (targetCellY != targetCenterY && fabsf(newDy) + 0.00001f < fabsf(oldDy)) return false;
+            } else if (newDx * newDx + newDy * newDy + 0.00001f < oldDx * oldDx + oldDy * oldDy) {
+                return false;
+            }
         }
     }
     return true;
@@ -4642,8 +4919,16 @@ static bool isWallCell(int mx, int my) { return mapCell(mx, my) != 0; }
 static void ensurePlayerInOpenCell() {
     const AssetInfo* ai = currentLgldAsset();
     if (ai && gLastLevelAssetIndex != gAssetIndex) {
+        // A loaded runtime snapshot already contains the exact saved player
+        // position.  Keep it when the level cache is initialized for the first
+        // frame; otherwise this reset would immediately replace it with the
+        // original level spawn below.
+        const bool keepSavedPosition = gPlayerStartChecked &&
+            gRuntimeAssetIndex == gAssetIndex &&
+            gRuntimeBlocks.size() == ai->lgldBlockData.size() &&
+            currentLgldOpenCell((int)floorf(gPlayerX), (int)floorf(gPlayerY));
         gLastLevelAssetIndex = gAssetIndex;
-        gPlayerStartChecked = false;
+        if (!keepSavedPosition) gPlayerStartChecked = false;
         gLevelTextureCacheAssetIndex = -99999;
     }
 
@@ -4775,7 +5060,10 @@ static void updatePlayerMotion() {
     }
     const int oldCellX = (int)floorf(gPlayerX), oldCellY = (int)floorf(gPlayerY);
     const int oldFloor = currentPlayerFloorHeight();
-    float turn = gPlayerDead ? 0.0f : gAnalogRX; if (fabsf(turn) < 0.10f) turn = 0.0f;
+    const float keyboardTurn = (gKeyboardTurnRight ? 1.0f : 0.0f) -
+                               (gKeyboardTurnLeft ? 1.0f : 0.0f);
+    float turn = gPlayerDead ? 0.0f : (keyboardTurn != 0.0f ? keyboardTurn : gAnalogRX);
+    if (fabsf(turn) < 0.10f) turn = 0.0f;
     gPlayerA += turn * 2.35f * (float)dt;
     float lookInput = gPlayerDead ? 0.0f : -gAnalogRY;
     if (fabsf(lookInput) < 0.12f) lookInput = 0.0f;
@@ -4798,13 +5086,17 @@ static void updatePlayerMotion() {
         (projectedLookOffset >= 0.0f ? 0.5f : -0.5f));
     gPlayerLookHorizonY = std::max(8, std::min(VIEW_H - 8,
         VIEW_CENTER_Y + roundedLookOffset));
-    float fwd = gPlayerDead ? 0.0f : -gAnalogLY;
-    float str = gPlayerDead ? 0.0f : gAnalogLX;
+    const float keyboardForward = (gKeyboardForward ? 1.0f : 0.0f) -
+                                  (gKeyboardBackward ? 1.0f : 0.0f);
+    const float keyboardStrafe = (gKeyboardStrafeRight ? 1.0f : 0.0f) -
+                                 (gKeyboardStrafeLeft ? 1.0f : 0.0f);
+    float fwd = gPlayerDead ? 0.0f : (keyboardForward != 0.0f ? keyboardForward : -gAnalogLY);
+    float str = gPlayerDead ? 0.0f : (keyboardStrafe != 0.0f ? keyboardStrafe : gAnalogLX);
     if (fabsf(fwd) < 0.12f) fwd = 0.0f;
     if (fabsf(str) < 0.12f) str = 0.0f;
     const float inputLength = sqrtf(fwd * fwd + str * str);
     const float movementAmount = std::min(1.0f, inputLength);
-    const float runScale = gRunHeld ? 1.5f : 1.0f;
+    const float runScale = (gRunHeld || gKeyboardRunHeld) ? 1.5f : 1.0f;
     if (!gPlayerDead && !gPlayerFalling && movementAmount > 0.0f) {
         static const signed char bobWave[64] = {
              0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 6, 7,
@@ -5330,17 +5622,30 @@ static unsigned int sampleSkyColorFiltered(const TextureBitmap& texture, float x
     return 0xff000000u | (blue << 16) | (green << 8) | red;
 }
 
+static const TextureBitmap* currentLevelSkyTexture() {
+    const AssetInfo* asset = currentLgldAsset();
+    if (!asset) return nullptr;
+    // The original renderer treats a negative ceiling-texture index as sky and
+    // uses that block's absolute texture index. Every outdoor Breathless level
+    // has one shared sky texture, so resolve it from the level data instead of
+    // the player's current (possibly roofed) block.
+    for (size_t blockIndex = 1; blockIndex < asset->lgldBlockData.size(); ++blockIndex) {
+        const int ceilingTexture = asset->lgldBlockData[blockIndex].ceilTex;
+        if (ceilingTexture >= 0) continue;
+        const TextureBitmap* texture = levelTextureByIndex(-ceilingTexture);
+        if (texture && texture->ok) return texture;
+    }
+    return nullptr;
+}
+
 static void drawSkyBackground() {
     // v33: Breathless outdoor levels use a wider panoramic sky feel.
     // v32 rotated the sky too slowly in open WLD1 areas, especially around BLES0008/map8.
     // Keep this isolated from wall/floor texture binding so only sky pan behaviour changes.
     const int horizon = currentViewHorizonY();
     const int lookOffset = horizon - VIEW_CENTER_Y;
-    bool playerHasSky = false;
-    int skyTextureIndex = 0;
-    const TextureBitmap* activeSky = floorTextureForCell((int)floorf(gPlayerX),
-        (int)floorf(gPlayerY), true, playerHasSky, skyTextureIndex);
-    if (!playerHasSky || !activeSky || !activeSky->ok) activeSky = &gSkyTex;
+    const TextureBitmap* activeSky = currentLevelSkyTexture();
+    if (!activeSky || !activeSky->ok) activeSky = &gSkyTex;
     const int pixelSizeX = std::max(1, std::min(2, gRenderPixelSizeX));
     const int pixelSizeY = std::max(1, std::min(2, gRenderPixelSizeY));
     for (int y = 0; y < horizon; y += pixelSizeY) for (int x = 0; x < FB_W; x += pixelSizeX) {
@@ -5843,6 +6148,94 @@ static void sealPortalWallGaps(int x, int y0, int y1, float distance, int brushO
     }
 }
 
+static unsigned int darkenBlobShadowPixel(unsigned int color, float strength) {
+    strength = std::max(0.0f, std::min(0.45f, strength));
+    const float multiplier = 1.0f - strength;
+    const unsigned int red = (unsigned int)((float)(color & 0xffu) * multiplier + 0.5f);
+    const unsigned int green = (unsigned int)((float)((color >> 8) & 0xffu) * multiplier + 0.5f);
+    const unsigned int blue = (unsigned int)((float)((color >> 16) & 0xffu) * multiplier + 0.5f);
+    return 0xff000000u | (blue << 16) | (green << 8) | red;
+}
+
+static void drawPlacedObjectBlobShadow(const RuntimeObject& runtime,
+                                       const GlobalObjectInfo& definition,
+                                       const LgldBlockInfo& objectBlock,
+                                       float depth, float lateral,
+                                       float dirX, float dirY,
+                                       float planeX, float planeY) {
+    if (!gBlobShadowsEnabled || runtime.dying || runtime.exploding || runtime.corpse ||
+        (definition.objectType != 2u && definition.objectType != 3u)) return;
+
+    const bool pickup = definition.objectType == 3u;
+    const int visualWidth = pickup
+        ? std::max(20, definition.spriteWidth)
+        : std::max(definition.radius * 2, definition.spriteWidth);
+    float hoverHeight = 0.0f;
+    float bobPosition = 0.0f;
+    if (pickup) {
+        bobPosition = sinf(runtime.bobPhase);
+        hoverHeight = (float)PICKUP_FLOAT_HEIGHT +
+            bobPosition * (float)PICKUP_BOB_AMPLITUDE;
+    } else if (definition.spriteYOffset >= 8) {
+        // EYE1/SKUL and any similarly authored enemy have a deliberate gap
+        // below their sprite. Small 1-3 pixel art-alignment offsets stay grounded.
+        hoverHeight = (float)definition.spriteYOffset;
+    }
+
+    float radiusScale = pickup
+        ? 0.94f - bobPosition * 0.12f
+        : 1.0f - std::min(0.28f, hoverHeight * 0.006f);
+    radiusScale = std::max(0.68f, std::min(1.06f, radiusScale));
+    const float radiusCells = std::max(0.11f,
+        (float)visualWidth * 0.5f * radiusScale / 64.0f);
+    const float heightStrength = pickup
+        ? 0.88f - bobPosition * 0.12f
+        : std::max(0.68f, 1.0f - hoverHeight / 150.0f);
+    const float baseStrength = (pickup ? 0.30f : 0.34f) * heightStrength;
+
+    const int screenX = (int)((float)FB_W * 0.5f * (1.0f + lateral / depth));
+    const int groundY = projectWorldYPortal(objectBlock.floorHeight, depth);
+    const float projection = (float)FB_H / ORIGINAL_VERTICAL_REFERENCE;
+    const int screenRadius = std::max(2, (int)ceilf(radiusCells * 64.0f * projection /
+        std::max(0.05f, depth)) + 2);
+    const int minX = std::max(0, screenX - screenRadius);
+    const int maxX = std::min(FB_W - 1, screenX + screenRadius);
+    const int minY = std::max(0, groundY - screenRadius);
+    const int maxY = std::min(VIEW_H - 1, groundY + screenRadius);
+    const float heightNumerator = ((float)gPlayerEyeZ - (float)objectBlock.floorHeight) * projection;
+
+    for (int y = minY; y <= maxY; ++y) {
+        const float denominator = (float)y + 0.5f - (float)currentViewHorizonY();
+        if (fabsf(denominator) < 0.25f) continue;
+        const float floorDepth = heightNumerator / denominator;
+        if (floorDepth <= 0.01f || fabsf(floorDepth - depth) > radiusCells * 1.35f) continue;
+        for (int x = minX; x <= maxX; ++x) {
+            const float cameraX = 2.0f * ((float)x + 0.5f) / (float)FB_W - 1.0f;
+            const float rayX = dirX + planeX * cameraX;
+            const float rayY = dirY + planeY * cameraX;
+            const float worldX = gPlayerX + rayX * floorDepth;
+            const float worldY = gPlayerY + rayY * floorDepth;
+            const float shadowX = worldX - runtime.x;
+            const float shadowY = worldY - runtime.y;
+            const float radial = (shadowX * shadowX + shadowY * shadowY) /
+                (radiusCells * radiusCells);
+            if (radial >= 1.0f) continue;
+
+            const LgldBlockInfo* floorBlock = currentLgldBlockForCell(
+                (int)floorf(worldX), (int)floorf(worldY));
+            if (!floorBlock || floorBlock->floorHeight != objectBlock.floorHeight) continue;
+            const size_t pixel = (size_t)y * FB_W + (size_t)x;
+            const float surfaceDepth = gWallDepth[pixel];
+            const float depthTolerance = std::max(0.035f, floorDepth * 0.035f);
+            if (surfaceDepth >= 1.0e29f || fabsf(surfaceDepth - floorDepth) > depthTolerance) continue;
+
+            const float feather = 1.0f - radial;
+            gFramebuffer[pixel] = darkenBlobShadowPixel(gFramebuffer[pixel],
+                baseStrength * feather * feather);
+        }
+    }
+}
+
 static void drawPlacedObjectBillboards() {
     const AssetInfo* ai = currentLgldAsset();
     if (!ai) return;
@@ -5864,6 +6257,23 @@ static void drawPlacedObjectBillboards() {
         if (depth > 0.05f && fabsf(lateral / depth) < 1.4f) visible.push_back(ProjectedObject{&runtime, depth, lateral});
     }
     std::sort(visible.begin(), visible.end(), [](const ProjectedObject& a, const ProjectedObject& b) { return a.depth > b.depth; });
+    // Shadows are composited onto the actual floor before any billboard is
+    // drawn. This prevents a nearer shadow from darkening a farther sprite and
+    // lets the existing world-depth buffer clip blobs at walls, doors and ledges.
+    for (size_t i = 0; i < visible.size(); ++i) {
+        const RuntimeObject& runtime = *visible[i].runtime;
+        const LgldPlacedObject& object = ai->lgldPlacedObjects[runtime.placedIndex];
+        const LgldBlockInfo* block = currentLgldBlockForCell(
+            (int)floorf(runtime.x), (int)floorf(runtime.y));
+        if (!block) continue;
+        std::map<std::string, GlobalObjectInfo>::const_iterator objectInfo =
+            gGlobalObjectInfo.find(object.name);
+        const GlobalObjectInfo* definition = runtime.deathDefinition ? runtime.deathDefinition :
+            (objectInfo != gGlobalObjectInfo.end() ? &objectInfo->second : nullptr);
+        if (!definition) continue;
+        drawPlacedObjectBlobShadow(runtime, *definition, *block,
+            visible[i].depth, visible[i].lateral, dirX, dirY, planeX, planeY);
+    }
     for (size_t i = 0; i < visible.size(); ++i) {
         const RuntimeObject& runtime = *visible[i].runtime;
         const LgldPlacedObject& object = ai->lgldPlacedObjects[runtime.placedIndex];
@@ -6038,8 +6448,9 @@ static void drawRuntimeImpactSparks() {
         const float remaining = std::max(0.0f, 1.0f - spark.age / spark.lifetime);
         const unsigned int color = shadeColor(spark.color,
             std::max(56, std::min(256, (int)(remaining * 256.0f))));
-        // Three samples make a one-to-three-pixel streak at 320-era
-        // resolution, while retaining a discrete shower of tiny particles.
+        // Keep the three-point streak, but give its bright leading particle a
+        // compact 3x3 core at normal combat distances. Nearby trail samples
+        // use the same size so wall, floor and ceiling impacts read more clearly.
         for (int trail = 0; trail < 3; ++trail) {
             const float t = (float)trail * 0.5f;
             const float worldX = spark.previousX + (spark.x - spark.previousX) * t;
@@ -6051,7 +6462,7 @@ static void drawRuntimeImpactSparks() {
             if (depth <= 0.03f || fabsf(lateral / depth) >= 1.35f) continue;
             const int screenX = (int)((float)FB_W * 0.5f * (1.0f + lateral / depth));
             const int screenY = projectWorldYPortal((int)worldZ, depth);
-            const int radius = depth < 1.25f && trail == 2 ? 1 : 0;
+            const int radius = ((trail == 2 && depth < 6.0f) || depth < 2.0f) ? 1 : 0;
             for (int py = screenY - radius; py <= screenY + radius; ++py) {
                 if ((unsigned)py >= (unsigned)VIEW_H) continue;
                 for (int px = screenX - radius; px <= screenX + radius; ++px) {
@@ -6533,7 +6944,9 @@ static void setFrontendState(FrontendState state) {
     if (state == FRONTEND_PAUSE && gFrontendState != FRONTEND_PAUSE) {
         std::lock_guard<std::mutex> lock(gGameSnapshotMutex);
         gPauseBackground = gHaveGameSnapshot ? gLastGameFramebuffer : gFramebuffer;
+        gPauseBackgroundRefreshRequested.store(false);
     }
+    if (state != FRONTEND_PAUSE) gPauseBackgroundRefreshRequested.store(false);
     gFrontendState = state;
     gFrontendStateSince = nowSeconds();
     if (state != FRONTEND_GAME) {
@@ -6541,6 +6954,13 @@ static void setFrontendState(FrontendState state) {
         gFireHeld = false;
         gFireLatch = false;
         gRunHeld = false;
+        gKeyboardForward = false;
+        gKeyboardBackward = false;
+        gKeyboardStrafeLeft = false;
+        gKeyboardStrafeRight = false;
+        gKeyboardTurnLeft = false;
+        gKeyboardTurnRight = false;
+        gKeyboardRunHeld = false;
         gNextAutoFireTime = 0.0;
         gFireReleaseDeadline = 0.0;
     }
@@ -6717,23 +7137,11 @@ static void drawGameOptionsMenu() {
     }
 }
 
-static void toggleRenderPixelSize() {
-    if (gRenderPixelSizeX == 1 && gRenderPixelSizeY == 1) {
-        gRenderPixelSizeX = 2; gRenderPixelSizeY = 1;
-    } else if (gRenderPixelSizeX == 2 && gRenderPixelSizeY == 1) {
-        gRenderPixelSizeX = 1; gRenderPixelSizeY = 2;
-    } else if (gRenderPixelSizeX == 1 && gRenderPixelSizeY == 2) {
-        gRenderPixelSizeX = 2; gRenderPixelSizeY = 2;
-    } else {
-        gRenderPixelSizeX = 1; gRenderPixelSizeY = 1;
-    }
-    playSoundResource("SWT1");
-    saveControlBindings();
-
+static void refreshPausedGameFrame() {
     if (gFrontendState == FRONTEND_PAUSE && currentLgldAsset()) {
-        // Re-render one frozen world frame immediately. This makes the new
-        // sampling mode visible behind the still-open pause menu instead of
-        // waiting for RESUME.
+        // Called only by the render thread. Input callbacks merely request this
+        // refresh so they can never race menu drawing and bake hover/text pixels
+        // into the stored pause background.
         const float savedLX = gAnalogLX, savedLY = gAnalogLY;
         const float savedRX = gAnalogRX, savedRY = gAnalogRY;
         gAnalogLX = gAnalogLY = gAnalogRX = gAnalogRY = 0.0f;
@@ -6748,14 +7156,40 @@ static void toggleRenderPixelSize() {
     }
 }
 
+static void toggleRenderPixelSize() {
+    if (gRenderPixelSizeX == 1 && gRenderPixelSizeY == 1) {
+        gRenderPixelSizeX = 2; gRenderPixelSizeY = 1;
+    } else if (gRenderPixelSizeX == 2 && gRenderPixelSizeY == 1) {
+        gRenderPixelSizeX = 1; gRenderPixelSizeY = 2;
+    } else if (gRenderPixelSizeX == 1 && gRenderPixelSizeY == 2) {
+        gRenderPixelSizeX = 2; gRenderPixelSizeY = 2;
+    } else {
+        gRenderPixelSizeX = 1; gRenderPixelSizeY = 1;
+    }
+    playSoundResource("SWT1");
+    saveControlBindings();
+    gPauseBackgroundRefreshRequested.store(true);
+}
+
+static void toggleBlobShadows() {
+    gBlobShadowsEnabled = !gBlobShadowsEnabled;
+    playSoundResource("SWT1");
+    saveControlBindings();
+    gPauseBackgroundRefreshRequested.store(true);
+}
+
 static void drawPauseMenu() {
+    if (gPauseBackgroundRefreshRequested.exchange(false)) refreshPausedGameFrame();
     if (gPauseBackground.size() == gFramebuffer.size()) gFramebuffer = gPauseBackground;
     drawTextCentered(51, "GAME MENU");
     char renderSize[32];
     snprintf(renderSize, sizeof(renderSize), "RENDER SIZE  %dx%d",
              gRenderPixelSizeX, gRenderPixelSizeY);
-    const char* entries[] = {"RESUME", renderSize, "RESTART LEVEL", "QUIT TO TITLE"};
-    for (int i = 0; i < 4; ++i) {
+    char blobShadows[32];
+    snprintf(blobShadows, sizeof(blobShadows), "BLOBSHADOWS  %s",
+             gBlobShadowsEnabled ? "YES" : "NO");
+    const char* entries[] = {"RESUME", renderSize, blobShadows, "RESTART LEVEL", "QUIT TO TITLE"};
+    for (int i = 0; i < 5; ++i) {
         const int y = 71 + i * 14;
         if (i == gPauseMenuSelection) fillRectSafe((FB_W - 136) / 2, y - 4, 136, 15, 0xff604020u);
         drawTextCentered(y, entries[i]);
@@ -6794,6 +7228,18 @@ static void drawOriginalHud() {
                 if (weaponMasks[weapon][row] & (1u << (7 - bit)))
                     putPixelSafe(HUD_X + baseX + bit, 160 + baseY + row, color);
             }
+        }
+        // Scores.asm KeyLightData: four 8x6 lamps in the lower-left HUD,
+        // ordered green/yellow on top and red/blue below.  Palette index 21 is
+        // the original inactive colour; the four active colours are unchanged.
+        static const int keyX[4] = {8, 24, 8, 24};
+        static const int keyY[4] = {8, 8, 23, 23};
+        static const unsigned char keyColor[4] = {61, 195, 62, 44};
+        for (int key = 0; key < 4; ++key) {
+            const unsigned int color = paletteColor(gPlayerKeys[key] ? keyColor[key] : 21);
+            for (int row = 0; row < 6; ++row)
+                for (int column = 0; column < 8; ++column)
+                    putPixelSafe(HUD_X + keyX[key] + column, 160 + keyY[key] + row, color);
         }
         // Original Scores.asm/PanelRefresh coordinates and original digit fonts.
         drawOriginalHudNumber(46, 20, std::min(9999999, gPlayerScore), 7, true);
@@ -6964,6 +7410,8 @@ static bool completeEndLevelFade() {
     gLevelExitActive = false;
     gLevelExitStarted = 0.0;
     gLevelExitCompleteAfter = 1.15;
+    memset(gPlayerKeys, 0, sizeof(gPlayerKeys));
+    memset(gCheckpointKeys, 0, sizeof(gCheckpointKeys));
     selectLevelRelative(1, "end-level");
     gRuntimeAssetIndex = -99999;
     gPlayerStartChecked = false;
@@ -7043,7 +7491,7 @@ static bool isConfirmKey(int keyCode) {
 }
 
 static bool isBackKey(int keyCode) {
-    return keyCode == 4 || keyCode == 97 || keyCode == 111;
+    return keyCode == 4 || keyCode == 67 || keyCode == 97 || keyCode == 111;
 }
 
 static void __attribute__((unused)) selectTextureRelative(int delta, const char* source) {
@@ -7239,25 +7687,45 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
 
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeKey(JNIEnv*, jclass, jint keyCode, jboolean pressed) {
     LOGI("key code=%d pressed=%d", (int)keyCode, (int)pressed);
-    // Physical shoulder chord; this observation does not consume or remap any
-    // normal controller event.
+    const bool keyDown = pressed != 0;
+    // ChromeOS/desktop gameplay bindings. Arrow keys intentionally retain
+    // their normal menu behavior outside gameplay.
+    if (gFrontendState == FRONTEND_GAME || !keyDown) {
+        if (keyCode == 51 || keyCode == 19) gKeyboardForward = keyDown;       // W / Up
+        else if (keyCode == 47 || keyCode == 20) gKeyboardBackward = keyDown; // S / Down
+        else if (keyCode == 29) gKeyboardStrafeLeft = keyDown;                // A
+        else if (keyCode == 32) gKeyboardStrafeRight = keyDown;               // D
+        else if (keyCode == 21 || keyCode == 45) gKeyboardTurnLeft = keyDown; // Left / Q
+        else if (keyCode == 22 || keyCode == 33) gKeyboardTurnRight = keyDown;// Right / E
+        else if (keyCode == 59 || keyCode == 60)                               // Shift
+            gKeyboardRunHeld = keyDown && gFrontendState == FRONTEND_GAME;
+    }
+    // Physical controller and ChromeOS keyboard chords. Observing these keys
+    // does not consume or remap their normal input behavior.
     int shoulder = -1;
     if (keyCode == 102) shoulder = 0;      // L1
     else if (keyCode == 104) shoulder = 1; // L2
     else if (keyCode == 103) shoulder = 2; // R1
     else if (keyCode == 105) shoulder = 3; // R2
-    if (shoulder >= 0) {
-        gCheatShoulders[shoulder] = pressed != 0;
-        const bool chord = gCheatShoulders[0] && gCheatShoulders[1] &&
-                           gCheatShoulders[2] && gCheatShoulders[3];
-        if (chord && !gCheatChordLatch && gFrontendState == FRONTEND_MENU) {
-            applyGodModeLoadout();
-            gGodModeMessageUntil = nowSeconds() + 3.0;
-            gCheatChordLatch = true;
-        } else if (!chord) gCheatChordLatch = false;
-    }
+    if (shoulder >= 0) gCheatShoulders[shoulder] = keyDown;
+    int desktopCheatKey = -1;
+    if (keyCode == 113) desktopCheatKey = 0;      // Left Ctrl
+    else if (keyCode == 57) desktopCheatKey = 1; // Left Alt
+    else if (keyCode == 58) desktopCheatKey = 2; // Right Alt / AltGr
+    else if (keyCode == 114) desktopCheatKey = 3;// Right Ctrl
+    if (desktopCheatKey >= 0) gCheatDesktopKeys[desktopCheatKey] = keyDown;
+    const bool controllerChord = gCheatShoulders[0] && gCheatShoulders[1] &&
+                                 gCheatShoulders[2] && gCheatShoulders[3];
+    const bool desktopChord = gCheatDesktopKeys[0] && gCheatDesktopKeys[1] &&
+                              gCheatDesktopKeys[2] && gCheatDesktopKeys[3];
+    const bool cheatChord = controllerChord || desktopChord;
+    if (cheatChord && !gCheatChordLatch && gFrontendState == FRONTEND_MENU) {
+        applyGodModeLoadout();
+        gGodModeMessageUntil = nowSeconds() + 3.0;
+        gCheatChordLatch = true;
+    } else if (!cheatChord) gCheatChordLatch = false;
     if (!pressed) {
-        if (keyCode == gFireKey) {
+        if (keyCode == gFireKey || keyCode == 113 || keyCode == 114) {
             if (gFrontendState == FRONTEND_GAME && gFireHeld)
                 gFireReleaseDeadline = nowSeconds() + 0.18;
             else {
@@ -7283,6 +7751,15 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         }
         gControlCapture = -1;
         return;
+    }
+    // WASD mirrors the cursor keys in every menu while remaining fixed
+    // movement keys during gameplay. This mapping is deliberately applied
+    // after control capture so W/A/S/D can still be assigned as custom keys.
+    if (gFrontendState != FRONTEND_GAME) {
+        if (keyCode == 51) keyCode = 19;      // W -> Up
+        else if (keyCode == 47) keyCode = 20; // S -> Down
+        else if (keyCode == 29) keyCode = 21; // A -> Left
+        else if (keyCode == 32) keyCode = 22; // D -> Right
     }
     if (gFrontendState == FRONTEND_LOGO1 || gFrontendState == FRONTEND_LOGO2) {
         if (isConfirmKey(keyCode) || keyCode == 4 || keyCode == 111) setFrontendState(FRONTEND_TITLE);
@@ -7319,10 +7796,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         return;
     }
     if (gFrontendState == FRONTEND_PAUSE) {
-        if (keyCode == 19) gPauseMenuSelection = (gPauseMenuSelection + 3) % 4;
-        else if (keyCode == 20) gPauseMenuSelection = (gPauseMenuSelection + 1) % 4;
+        if (keyCode == 19) gPauseMenuSelection = (gPauseMenuSelection + 4) % 5;
+        else if (keyCode == 20) gPauseMenuSelection = (gPauseMenuSelection + 1) % 5;
         else if ((keyCode == 21 || keyCode == 22) && gPauseMenuSelection == 1)
             toggleRenderPixelSize();
+        else if ((keyCode == 21 || keyCode == 22) && gPauseMenuSelection == 2)
+            toggleBlobShadows();
         else if (isBackKey(keyCode) || keyCode == 82 || keyCode == gMenuKey || keyCode == 110)
             setFrontendState(FRONTEND_GAME);
         else if (isConfirmKey(keyCode)) {
@@ -7330,6 +7809,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
             else if (gPauseMenuSelection == 1) {
                 toggleRenderPixelSize();
             } else if (gPauseMenuSelection == 2) {
+                toggleBlobShadows();
+            } else if (gPauseMenuSelection == 3) {
                 gRestoreLevelCheckpoint = true;
                 gRuntimeAssetIndex = -99999;
                 gPlayerStartChecked = false;
@@ -7396,7 +7877,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         return;
     }
     if (gLevelExitActive) return;
-    if (keyCode == gMapKey && !gPlayerDead) {
+    if ((keyCode == gMapKey || keyCode == 61) && !gPlayerDead) { // SELECT / Tab
         gAnalogLX = gAnalogLY = gAnalogRX = gAnalogRY = 0.0f;
         gRunHeld = false;
         setFrontendState(FRONTEND_MAP);
@@ -7409,7 +7890,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         setFrontendState(FRONTEND_PAUSE);
         return;
     }
-    if (keyCode == gFireKey) {
+    if (keyCode == gFireKey || keyCode == 113 || keyCode == 114) { // R2 / Ctrl
         // Some Android gamepads emit short DOWN/UP pulses while a trigger is
         // held. Only the first DOWN starts the cadence; repeats neither fire an
         // extra shot nor postpone the next timed autofire shot.
@@ -7422,6 +7903,19 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         gFireReleaseDeadline = 0.0;
     }
     else if (keyCode == gRunKey && !gPlayerDead) gRunHeld = true;
+    else if ((keyCode == 59 || keyCode == 60) && !gPlayerDead) gKeyboardRunHeld = true;
+    else if ((keyCode == 62 || keyCode == 66) && !gPlayerDead) // Space / Enter
+        activateSwitchInFront();
+    else if ((keyCode >= 8 && keyCode <= 13) || (keyCode >= 145 && keyCode <= 150)) {
+        const int weapon = keyCode >= 145 ? keyCode - 145 : keyCode - 8;
+        if (!gPlayerDead && weapon >= 0 && weapon < PLAYER_WEAPON_COUNT && gPlayerWeapons[weapon]) {
+            stopSoundGroup(1);
+            gPlayerWeapon = weapon;
+            gPickupMessage = "WEAPON SELECTED";
+            gPickupMessageUntil = nowSeconds() + 1.0;
+            markGameProgressDirty();
+        }
+    }
     else if (keyCode == gWeaponKey) {
         for (int step = 1; step <= PLAYER_WEAPON_COUNT; ++step) {
             const int candidate = (gPlayerWeapon + step) % PLAYER_WEAPON_COUNT;
@@ -7436,6 +7930,109 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         }
     }
     else if (keyCode == gActivateKey && !gPlayerDead) activateSwitchInFront();
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeTouchAction(
+        JNIEnv* env, jclass clazz, jstring actionId, jboolean pressed) {
+    if (!actionId) return;
+    const char* action = env->GetStringUTFChars(actionId, 0);
+    if (!action) return;
+    int keyCode = 0;
+    if (strcmp(action, "fire") == 0) keyCode = gFireKey;
+    else if (strcmp(action, "use") == 0) keyCode = gActivateKey;
+    else if (strcmp(action, "run") == 0) keyCode = gRunKey;
+    else if (strcmp(action, "weapon_next") == 0) keyCode = gWeaponKey;
+    else if (pressed && strcmp(action, "weapon_prev") == 0) {
+        if (gFrontendState == FRONTEND_GAME && !gPlayerDead) {
+            for (int step = 1; step <= PLAYER_WEAPON_COUNT; ++step) {
+                const int candidate = (gPlayerWeapon - step + PLAYER_WEAPON_COUNT) % PLAYER_WEAPON_COUNT;
+                if (gPlayerWeapons[candidate]) {
+                    stopSoundGroup(1);
+                    gPlayerWeapon = candidate;
+                    gPickupMessage = "WEAPON SELECTED";
+                    gPickupMessageUntil = nowSeconds() + 1.0;
+                    markGameProgressDirty();
+                    break;
+                }
+            }
+        }
+    }
+    else if (strcmp(action, "map") == 0) keyCode = gMapKey;
+    else if (strcmp(action, "menu") == 0) keyCode = gMenuKey;
+    else if (strcmp(action, "nav_up") == 0) keyCode = 19;
+    else if (strcmp(action, "nav_down") == 0) keyCode = 20;
+    else if (strcmp(action, "nav_left") == 0) keyCode = 21;
+    else if (strcmp(action, "nav_right") == 0) keyCode = 22;
+    else if (strcmp(action, "nav_ok") == 0) keyCode = 23;
+    else if (strcmp(action, "nav_back") == 0) keyCode = 4;
+    else if (pressed && strncmp(action, "weapon_", 7) == 0 &&
+             action[7] >= '1' && action[7] <= '6' && action[8] == '\0') {
+        const int weapon = action[7] - '1';
+        if (gFrontendState == FRONTEND_GAME && !gPlayerDead && gPlayerWeapons[weapon]) {
+            stopSoundGroup(1);
+            gPlayerWeapon = weapon;
+            gPickupMessage = "WEAPON SELECTED";
+            gPickupMessageUntil = nowSeconds() + 1.0;
+            markGameProgressDirty();
+        }
+    }
+    env->ReleaseStringUTFChars(actionId, action);
+    if (keyCode != 0) {
+        Java_com_ast_breathlessamiga_MainActivity_nativeKey(env, clazz, keyCode, pressed);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeTouchMove(
+        JNIEnv*, jclass, jfloat x, jfloat y) {
+    if (gFrontendState != FRONTEND_GAME || gPlayerDead || gLevelExitActive) {
+        gAnalogLX = gAnalogLY = 0.0f;
+        return;
+    }
+    gAnalogLX = std::max(-1.0f, std::min(1.0f, (float)x));
+    gAnalogLY = std::max(-1.0f, std::min(1.0f, (float)y));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeTouchLook(
+        JNIEnv*, jclass, jfloat deltaX, jfloat deltaY) {
+    if (gFrontendState != FRONTEND_GAME || gPlayerDead || gLevelExitActive) return;
+    gPlayerA += (float)deltaX * 4.4f;
+    if (gPlayerA > 6.28318530718f || gPlayerA < -6.28318530718f)
+        gPlayerA = fmodf(gPlayerA, 6.28318530718f);
+    gPlayerLookSpeed = 0.0f;
+    gPlayerLookUnits = std::max(-72.0f, std::min(72.0f,
+        gPlayerLookUnits - (float)deltaY * 240.0f));
+}
+
+extern "C" JNIEXPORT jint JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeTouchMode(
+        JNIEnv*, jclass) {
+    if (gOuyaDevice) return 0;
+    if (gFrontendState == FRONTEND_GAME && !gLevelExitActive) return 1;
+    if (gFrontendState == FRONTEND_MENU || gFrontendState == FRONTEND_SOUND ||
+        gFrontendState == FRONTEND_CONTROLS || gFrontendState == FRONTEND_GAME_OPTIONS ||
+        gFrontendState == FRONTEND_MAP || gFrontendState == FRONTEND_PAUSE ||
+        gFrontendState == FRONTEND_TERMINAL) return 2;
+    return 0;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeResetDesktopInput(
+        JNIEnv*, jclass) {
+    gKeyboardForward = false;
+    gKeyboardBackward = false;
+    gKeyboardStrafeLeft = false;
+    gKeyboardStrafeRight = false;
+    gKeyboardTurnLeft = false;
+    gKeyboardTurnRight = false;
+    gKeyboardRunHeld = false;
+    for (int i = 0; i < 4; ++i) {
+        gCheatShoulders[i] = false;
+        gCheatDesktopKeys[i] = false;
+    }
+    gCheatChordLatch = false;
+    gFireHeld = false;
+    gFireLatch = false;
+    gNextAutoFireTime = 0.0;
+    gFireReleaseDeadline = 0.0;
+    stopLoopingSoundGroup(1);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeAnalog(JNIEnv*, jclass, jfloat lx, jfloat ly, jfloat rx, jfloat ry, jfloat hatX, jfloat hatY) {
@@ -7468,8 +8065,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
                     gSoundVoices.clear();
                 }
             } else if (gSoundMenuSelection == 3) gMusicEnabled = !gMusicEnabled;
-        } else if (gFrontendState == FRONTEND_PAUSE && gPauseMenuSelection == 1 && hx != 0)
-            toggleRenderPixelSize();
+        } else if (gFrontendState == FRONTEND_PAUSE && hx != 0) {
+            if (gPauseMenuSelection == 1) toggleRenderPixelSize();
+            else if (gPauseMenuSelection == 2) toggleBlobShadows();
+        }
         lastHatX = hx;
     }
     if (hy != lastHatY) {
@@ -7483,8 +8082,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
             if (hy > 0) gControlsMenuSelection = (gControlsMenuSelection + 1) % 7;
             else if (hy < 0) gControlsMenuSelection = (gControlsMenuSelection + 6) % 7;
         } else if (gFrontendState == FRONTEND_PAUSE) {
-            if (hy > 0) gPauseMenuSelection = (gPauseMenuSelection + 1) % 4;
-            else if (hy < 0) gPauseMenuSelection = (gPauseMenuSelection + 3) % 4;
+            if (hy > 0) gPauseMenuSelection = (gPauseMenuSelection + 1) % 5;
+            else if (hy < 0) gPauseMenuSelection = (gPauseMenuSelection + 4) % 5;
         } else if (gFrontendState == FRONTEND_TERMINAL) {
             const int count = runtimeTerminalChoiceCount();
             if (hy > 0) gRuntimeTerminalSelection = (gRuntimeTerminalSelection + 1) % count;
@@ -7548,12 +8147,14 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
     } else if (gFrontendState == FRONTEND_SOUND || gFrontendState == FRONTEND_CONTROLS) {
         setFrontendState(FRONTEND_MENU);
     } else if (gFrontendState == FRONTEND_PAUSE) {
-        if (virtualY >= 64.0f && virtualY < 120.0f) {
-            gPauseMenuSelection = std::max(0, std::min(3, (int)((virtualY - 64.0f) / 14.0f)));
+        if (virtualY >= 64.0f && virtualY < 134.0f) {
+            gPauseMenuSelection = std::max(0, std::min(4, (int)((virtualY - 64.0f) / 14.0f)));
             if (gPauseMenuSelection == 0) setFrontendState(FRONTEND_GAME);
             else if (gPauseMenuSelection == 1) {
                 toggleRenderPixelSize();
             } else if (gPauseMenuSelection == 2) {
+                toggleBlobShadows();
+            } else if (gPauseMenuSelection == 3) {
                 gRestoreLevelCheckpoint = true;
                 gRuntimeAssetIndex = -99999;
                 gPlayerStartChecked = false;

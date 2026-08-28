@@ -7,12 +7,16 @@ import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.View;
 import android.view.Window;
+import android.widget.FrameLayout;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.media.MediaPlayer;
 import android.content.res.AssetFileDescriptor;
+import android.content.res.Configuration;
+import android.content.pm.PackageManager;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -22,6 +26,8 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import com.ast.retrotouch.RetroTouchView;
+import com.ast.retrotouch.RetroTouchControllers;
 
 public class MainActivity extends Activity {
     private static final String TAG = "Breathless";
@@ -47,11 +53,25 @@ public class MainActivity extends Activity {
     };
 
     private BreathlessView glView;
+    private RetroTouchView retroTouch;
+    private BreathlessTouchBridge touchBridge;
     private long lastAnalogLogMs = 0;
     private volatile boolean audioRunning = false;
     private Thread audioThread;
     private MediaPlayer musicPlayer;
     private String playingMusicCode;
+    private boolean touchSyncRunning;
+    private boolean chromeOsDevice;
+    private boolean desktopInputActive;
+    private boolean mousePrimaryDown;
+    private boolean mouseSecondaryDown;
+    private final Runnable touchSyncRunnable = new Runnable() {
+        @Override public void run() {
+            if (!touchSyncRunning) return;
+            syncTouchOverlay();
+            if (glView != null) glView.postDelayed(this, 200L);
+        }
+    };
 
     static {
         System.loadLibrary("breathless_native");
@@ -62,6 +82,11 @@ public class MainActivity extends Activity {
     private static native void nativeSaveProgress();
     private static native void nativeKey(int keyCode, boolean pressed);
     private static native void nativeTouch(float x, float y, int action);
+    private static native void nativeTouchAction(String actionId, boolean pressed);
+    private static native void nativeTouchMove(float x, float y);
+    private static native void nativeTouchLook(float deltaX, float deltaY);
+    private static native int nativeTouchMode();
+    private static native void nativeResetDesktopInput();
     private static native void nativeAnalog(float lx, float ly, float rx, float ry, float hatX, float hatY);
     private static native void nativeMixAudio(short[] output);
     private static native String nativeMusicCode();
@@ -80,9 +105,54 @@ public class MainActivity extends Activity {
         migrateLegacyState(dataDir);
         nativeSetOuyaDevice(PlatformUi.isOuyaDevice());
         nativeSetDataPath(dataDir.getAbsolutePath());
+        chromeOsDevice = isChromeOsDevice();
+        desktopInputActive = chromeOsDevice || hasHardwareKeyboard();
 
         glView = new BreathlessView(this);
-        setContentView(PlatformUi.wrapContent(this, glView));
+        glView.setCapturedPointerListener(new BreathlessView.CapturedPointerListener() {
+            @Override public boolean onCapturedPointerEvent(MotionEvent event) {
+                return handleMouseEvent(event, true);
+            }
+
+            @Override public void onPointerCaptureChanged(boolean hasCapture) {
+                if (!hasCapture) releaseMouseButtons();
+            }
+        });
+        glView.setOnTouchListener(new View.OnTouchListener() {
+            @Override public boolean onTouch(View view, MotionEvent event) {
+                if (isMouseEvent(event)) {
+                    if (handleMouseEvent(event, false)) return true;
+                    // Menus still accept a mouse click at its screen position,
+                    // but it must never switch the app back to touch mode.
+                    nativeTouch(event.getX(), event.getY(), event.getActionMasked());
+                    if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                        updateMusic();
+                        if (nativeConsumeQuitRequest()) finish();
+                    }
+                    syncTouchOverlay();
+                    return true;
+                }
+                if (!chromeOsDevice && event.getActionMasked() == MotionEvent.ACTION_DOWN &&
+                        desktopInputActive) {
+                    desktopInputActive = false;
+                    releaseDesktopPointerCapture();
+                    nativeResetDesktopInput();
+                    syncTouchOverlay();
+                }
+                nativeTouch(event.getX(), event.getY(), event.getActionMasked());
+                if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                    updateMusic();
+                    if (nativeConsumeQuitRequest()) finish();
+                }
+                return true;
+            }
+        });
+        retroTouch = createRetroTouch();
+        if (chromeOsDevice) retroTouch.setVisibility(View.GONE);
+        final FrameLayout gameLayers = new TouchHostLayout(this);
+        gameLayers.addView(glView, matchParent());
+        gameLayers.addView(retroTouch, matchParent());
+        setContentView(PlatformUi.wrapContent(this, gameLayers));
         PlatformUi.installSystemUiRestorer(this);
         glView.post(new Runnable() {
             @Override public void run() {
@@ -100,15 +170,26 @@ public class MainActivity extends Activity {
             glView.onResume();
             glView.requestFocus();
         }
+        syncTouchOverlay();
         startAudio();
         updateMusic();
+        touchSyncRunning = true;
+        if (glView != null) {
+            glView.removeCallbacks(touchSyncRunnable);
+            glView.post(touchSyncRunnable);
+        }
     }
 
     @Override
     protected void onPause() {
+        touchSyncRunning = false;
+        if (glView != null) glView.removeCallbacks(touchSyncRunnable);
+        if (touchBridge != null) touchBridge.reset();
         stopAudio();
         stopMusic();
         nativeAnalog(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        nativeResetDesktopInput();
+        releaseDesktopPointerCapture();
         saveProgressOnRenderThread();
         if (glView != null) glView.onPause();
         super.onPause();
@@ -211,7 +292,14 @@ public class MainActivity extends Activity {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (hasFocus) applyGameUi();
+        if (hasFocus) {
+            applyGameUi();
+            if (glView != null) glView.requestFocus();
+        } else {
+            releaseDesktopPointerCapture();
+            releaseMouseButtons();
+            nativeResetDesktopInput();
+        }
     }
 
     private void applyGameUi() {
@@ -228,35 +316,38 @@ public class MainActivity extends Activity {
         }
         int action = event.getAction();
         if (action == KeyEvent.ACTION_DOWN || action == KeyEvent.ACTION_UP) {
+            final boolean desktopKeyboard = isKeyboardSource(event.getSource()) &&
+                    !isControllerSource(event.getSource());
+            if (desktopKeyboard) {
+                desktopInputActive = true;
+                if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() > 0 &&
+                        !isDesktopMovementKey(keyCode)) return true;
+            }
+            if (retroTouch != null && nativeTouchMode() != BreathlessTouchBridge.MODE_OFF &&
+                    isControllerSource(event.getSource()))
+                retroTouch.notifyControllerInput();
             nativeKey(keyCode, action == KeyEvent.ACTION_DOWN);
             if (action == KeyEvent.ACTION_DOWN) {
                 updateMusic();
                 if (nativeConsumeQuitRequest()) finish();
             }
+            syncTouchOverlay();
             return true;
         }
         return super.dispatchKeyEvent(event);
     }
 
     @Override
-    public boolean dispatchTouchEvent(MotionEvent event) {
-        float localX = event.getX();
-        float localY = event.getY();
-        if (glView != null) {
-            localX = Math.max(0.0f, Math.min(glView.getWidth(), localX - glView.getLeft()));
-            localY = Math.max(0.0f, Math.min(glView.getHeight(), localY - glView.getTop()));
-        }
-        nativeTouch(localX, localY, event.getActionMasked());
-        if (event.getActionMasked() == MotionEvent.ACTION_UP) {
-            updateMusic();
-            if (nativeConsumeQuitRequest()) finish();
-        }
-        return true;
-    }
-
-    @Override
     public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        if (isMouseEvent(event)) {
+            final boolean handled = handleMouseEvent(event, false);
+            syncTouchOverlay();
+            if (handled) return true;
+        }
         if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
+            if (retroTouch != null && nativeTouchMode() != BreathlessTouchBridge.MODE_OFF &&
+                    isControllerSource(event.getSource()))
+                retroTouch.notifyControllerInput();
             float rawX = axis(event, MotionEvent.AXIS_X);
             float rawY = axis(event, MotionEvent.AXIS_Y);
             float rawZ = axis(event, MotionEvent.AXIS_Z);
@@ -311,6 +402,207 @@ public class MainActivity extends Activity {
         float ca = centered(a);
         float cb = centered(b);
         return Math.abs(ca) >= Math.abs(cb) ? ca : cb;
+    }
+
+    private boolean handleMouseEvent(MotionEvent event, boolean captured) {
+        final int mode = nativeTouchMode();
+        final boolean gameplay = mode == BreathlessTouchBridge.MODE_GAMEPLAY;
+        final int action = event.getActionMasked();
+        desktopInputActive = true;
+        if (!gameplay && !captured) return false;
+        if ((action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_HOVER_MOVE) && captured) {
+            final float dx = axis(event, MotionEvent.AXIS_RELATIVE_X);
+            final float dy = axis(event, MotionEvent.AXIS_RELATIVE_Y);
+            final float reference = Math.max(320.0f, glView != null ? glView.getHeight() : 720.0f);
+            if (dx != 0.0f || dy != 0.0f)
+                nativeTouchLook(dx / reference, dy / reference);
+            return true;
+        }
+
+        if (action == MotionEvent.ACTION_SCROLL && gameplay) {
+            final float scroll = axis(event, MotionEvent.AXIS_VSCROLL);
+            if (scroll != 0.0f) {
+                final String actionId = scroll > 0.0f ? "weapon_prev" : "weapon_next";
+                final int steps = Math.max(1, Math.min(3, (int)Math.ceil(Math.abs(scroll))));
+                for (int i = 0; i < steps; ++i) {
+                    nativeTouchAction(actionId, true);
+                    nativeTouchAction(actionId, false);
+                }
+                updateMusic();
+            }
+            return true;
+        }
+
+        if (action == MotionEvent.ACTION_BUTTON_PRESS || action == MotionEvent.ACTION_BUTTON_RELEASE ||
+                action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_UP) {
+            final boolean pressed = action == MotionEvent.ACTION_BUTTON_PRESS || action == MotionEvent.ACTION_DOWN;
+            final int button = Build.VERSION.SDK_INT >= 23 && event.getActionButton() != 0 ?
+                    event.getActionButton() : MotionEvent.BUTTON_PRIMARY;
+            if (pressed && gameplay) requestDesktopPointerCapture();
+            if ((button & MotionEvent.BUTTON_PRIMARY) != 0) setMousePrimary(pressed && gameplay);
+            if ((button & MotionEvent.BUTTON_SECONDARY) != 0) setMouseSecondary(pressed && gameplay);
+            if (pressed && gameplay && (button & MotionEvent.BUTTON_TERTIARY) != 0) {
+                nativeTouchAction("weapon_next", true);
+                nativeTouchAction("weapon_next", false);
+            }
+            updateMusic();
+            return true;
+        }
+        // Never let an uncaptured mouse event fall through as a touchscreen
+        // gesture. Otherwise RetroTouch treats the first mouse click as a
+        // finger press and makes the touch controls visible.
+        return captured || gameplay;
+    }
+
+    private void setMousePrimary(boolean pressed) {
+        if (mousePrimaryDown == pressed) return;
+        mousePrimaryDown = pressed;
+        nativeTouchAction("fire", pressed);
+    }
+
+    private void setMouseSecondary(boolean pressed) {
+        if (mouseSecondaryDown == pressed) return;
+        mouseSecondaryDown = pressed;
+        nativeTouchAction("use", pressed);
+    }
+
+    private void releaseMouseButtons() {
+        setMousePrimary(false);
+        setMouseSecondary(false);
+    }
+
+    private void requestDesktopPointerCapture() {
+        if (Build.VERSION.SDK_INT >= 26 && glView != null && !glView.hasPointerCapture()) {
+            glView.requestFocus();
+            try {
+                glView.requestPointerCapture();
+            } catch (IllegalStateException notAttachedYet) {
+                // The periodic overlay/input sync retries once the GLSurfaceView
+                // is attached and owns window focus.
+            }
+        }
+    }
+
+    private void releaseDesktopPointerCapture() {
+        if (Build.VERSION.SDK_INT >= 26 && glView != null && glView.hasPointerCapture())
+            glView.releasePointerCapture();
+    }
+
+    private boolean hasHardwareKeyboard() {
+        return getResources().getConfiguration().keyboard != Configuration.KEYBOARD_NOKEYS;
+    }
+
+    private boolean isChromeOsDevice() {
+        final PackageManager packages = getPackageManager();
+        if (packages.hasSystemFeature("android.hardware.type.pc") ||
+                packages.hasSystemFeature("org.chromium.arc") ||
+                packages.hasSystemFeature("org.chromium.arc.device_management")) return true;
+        final String device = Build.DEVICE == null ? "" : Build.DEVICE.toLowerCase();
+        final String product = Build.PRODUCT == null ? "" : Build.PRODUCT.toLowerCase();
+        return device.contains("cheets") || product.contains("cheets");
+    }
+
+    private static boolean isMouseSource(int source) {
+        return (source & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE;
+    }
+
+    private static boolean isMouseEvent(MotionEvent event) {
+        if (isMouseSource(event.getSource())) return true;
+        for (int i = 0; i < event.getPointerCount(); ++i) {
+            if (event.getToolType(i) == MotionEvent.TOOL_TYPE_MOUSE) return true;
+        }
+        return false;
+    }
+
+    private static boolean isKeyboardSource(int source) {
+        return (source & InputDevice.SOURCE_KEYBOARD) == InputDevice.SOURCE_KEYBOARD;
+    }
+
+    private static boolean isDesktopMovementKey(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_W || keyCode == KeyEvent.KEYCODE_A ||
+                keyCode == KeyEvent.KEYCODE_S || keyCode == KeyEvent.KEYCODE_D ||
+                keyCode == KeyEvent.KEYCODE_Q || keyCode == KeyEvent.KEYCODE_E ||
+                keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
+                keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT;
+    }
+
+    private RetroTouchView createRetroTouch() {
+        touchBridge = new BreathlessTouchBridge(this, new BreathlessTouchBridge.HostInput() {
+            @Override public void onAction(String actionId, boolean pressed) {
+                nativeTouchAction(actionId, pressed);
+                if (pressed && nativeConsumeQuitRequest()) finish();
+            }
+
+            @Override public void onMove(float x, float y) {
+                nativeTouchMove(x, y);
+            }
+
+            @Override public void onLook(float deltaX, float deltaY) {
+                nativeTouchLook(deltaX, deltaY);
+            }
+        });
+        return touchBridge.getView();
+    }
+
+    private void syncTouchOverlay() {
+        if (touchBridge != null) {
+            if (chromeOsDevice) {
+                if (retroTouch != null && retroTouch.getVisibility() != View.GONE)
+                    retroTouch.setVisibility(View.GONE);
+                touchBridge.setMode(BreathlessTouchBridge.MODE_OFF);
+                final int nativeMode = nativeTouchMode();
+                if (nativeMode != BreathlessTouchBridge.MODE_GAMEPLAY) {
+                    releaseDesktopPointerCapture();
+                    releaseMouseButtons();
+                } else {
+                    desktopInputActive = true;
+                    requestDesktopPointerCapture();
+                }
+                return;
+            }
+            if (retroTouch != null && retroTouch.getVisibility() != View.VISIBLE)
+                retroTouch.setVisibility(View.VISIBLE);
+            boolean controllerAvailable = RetroTouchControllers.isControllerConnected();
+            final int nativeMode = nativeTouchMode();
+            if (nativeMode != BreathlessTouchBridge.MODE_GAMEPLAY) {
+                releaseDesktopPointerCapture();
+                releaseMouseButtons();
+            } else if (desktopInputActive) {
+                // ChromeOS may start the Activity with a visible system cursor.
+                // Reacquire it as soon as gameplay has focus; the first click
+                // remains a fallback for devices that require a user gesture.
+                requestDesktopPointerCapture();
+            }
+            int mode = PlatformUi.isOuyaDevice() || controllerAvailable || desktopInputActive ?
+                    BreathlessTouchBridge.MODE_OFF : nativeMode;
+            touchBridge.setMode(mode);
+        }
+    }
+
+    private static boolean isControllerSource(int source) {
+        return (source & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+                (source & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+    }
+
+    private static FrameLayout.LayoutParams matchParent() {
+        return new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT);
+    }
+
+    private final class TouchHostLayout extends FrameLayout {
+        TouchHostLayout(android.content.Context context) { super(context); }
+
+        @Override public boolean dispatchTouchEvent(MotionEvent event) {
+            if (isMouseEvent(event)) {
+                desktopInputActive = true;
+                syncTouchOverlay();
+                if (handleMouseEvent(event, false)) return true;
+            }
+            syncTouchOverlay();
+            boolean handled = super.dispatchTouchEvent(event);
+            syncTouchOverlay();
+            return handled;
+        }
     }
 
     private File gameDataDirectory() {

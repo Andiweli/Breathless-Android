@@ -10,8 +10,8 @@ android {
 
     defaultConfig {
         applicationId 'com.ast.breathlessamiga'
-        versionCode 37
-        versionName '1.0-dual-platform'
+        versionCode 38
+        versionName '1.1'
 
         externalNativeBuild {
             cmake {
@@ -27,16 +27,16 @@ android {
             dimension 'platform'
             minSdkVersion 16
             targetSdkVersion 28
-            versionNameSuffix '-ouya'
             ndk {
-                abiFilters 'armeabi-v7a'
+                // One normal/OUYA APK also covers ARM64 and native x86_64
+                // Chromebooks without relying on ChromeOS ARM translation.
+                abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86_64'
             }
         }
         automotive {
             dimension 'platform'
             minSdkVersion 28
             targetSdkVersion 35
-            versionNameSuffix '-automotive'
             ndk {
                 abiFilters 'arm64-v8a', 'x86_64'
             }
@@ -48,4 +48,10 @@ android {
             path file('src/main/cpp/CMakeLists.txt')
         }
     }
+}
+
+dependencies {
+    // RetroTouch is intentionally isolated as one replaceable binary. Compatible updates only
+    // require replacing app/libs/retrotouch.aar and rebuilding the game.
+    implementation files('libs/retrotouch.aar')
 }
