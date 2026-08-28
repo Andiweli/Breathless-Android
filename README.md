@@ -6,7 +6,7 @@ A native Android port of **Breathless**, the 1995 Commodore Amiga first-person s
 
 ![Android](https://img.shields.io/badge/OS-Android%204.1%2B-green)
 ![Architecture](https://img.shields.io/badge/architecture-ARMv7%20%7C%20ARM64-orange)
-![Controller](https://img.shields.io/badge/controls-Gamepad-blueviolet)
+![Controller](https://img.shields.io/badge/controls-Gamepad/Touch/Keyb-blueviolet)
 [![Support via PayPal](https://img.shields.io/badge/Support%20via-PayPal-0070BA?logo=paypal&logoColor=white)](https://paypal.me/andiweli)
 
 ## About the Breathless Android Port
