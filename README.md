@@ -15,19 +15,21 @@ A native Android port of **Breathless**, the 1995 Commodore Amiga first-person s
 
 This native Android port preserves the look, levels, gameplay and atmosphere of the Amiga original. It provides dedicated builds for OUYA and modern Android devices.
 
+### There has been added...
+- Touch controls featuring *RetroTouch* for use without a controller
+- Compatibility with Chromebooks/ChromeOS with mouse/keyboard
+- Blob shadows on enemies and items/powerups
+- Pixel sizing for low performance devices
+
+## Screenshots
+
 <img width="1920" height="1080" alt="breathless0" src="https://github.com/user-attachments/assets/2a134053-cdbf-4128-9d35-09f366155270" />
 <img width="1920" height="1080" alt="breathless1" src="https://github.com/user-attachments/assets/532e5ad8-373f-437b-a693-107bf65bda9a" />
 <img width="1920" height="1080" alt="breathless4" src="https://github.com/user-attachments/assets/132f797c-7823-4e1d-a6de-324d77ad7beb" />
 
-
 ## Install Breathless on Android
 
 [Download the appropriate APK](https://github.com/Andiweli/Breathless-Android/releases) for your platform or build one with Android Studio, then install it with Android's package installer. If required, allow installation from the app used to open the APK.
-
-## Planned Features
-
-- Touch input support
-- Some render effects like blob shadows
 
 ## Legal Notice
 
