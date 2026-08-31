@@ -25,6 +25,8 @@ This native Android port preserves the look, levels, gameplay and atmosphere of 
 
 <img width="1920" height="1080" alt="breathless0" src="https://github.com/user-attachments/assets/2a134053-cdbf-4128-9d35-09f366155270" />
 <img width="1920" height="1080" alt="breathless1" src="https://github.com/user-attachments/assets/532e5ad8-373f-437b-a693-107bf65bda9a" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/84fb6ce6-539f-4321-ad2e-76abe6e4ff7a" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/9d5eef38-abc6-44b8-9262-51ebbf40c384" />
 <img width="1920" height="1080" alt="breathless4" src="https://github.com/user-attachments/assets/132f797c-7823-4e1d-a6de-324d77ad7beb" />
 
 ## Install Breathless on Android
