@@ -2383,7 +2383,7 @@ static bool saveControlBindings() {
     std::vector<unsigned char> bytes;
     static const unsigned char magic[8] = {'B','L','C','T','R','L','0','1'};
     bytes.insert(bytes.end(), magic, magic + sizeof(magic));
-    appendSaveU32(bytes, 6u);
+    appendSaveU32(bytes, 7u);
     appendSaveU32(bytes, (unsigned int)gFireKey);
     appendSaveU32(bytes, (unsigned int)gActivateKey);
     appendSaveU32(bytes, (unsigned int)gWeaponKey);
@@ -2393,6 +2393,10 @@ static bool saveControlBindings() {
     appendSaveU32(bytes, (unsigned int)gRenderPixelSizeX);
     appendSaveU32(bytes, (unsigned int)gRenderPixelSizeY);
     appendSaveU32(bytes, gBlobShadowsEnabled ? 1u : 0u);
+    appendSaveU32(bytes, (unsigned int)gSoundVolume);
+    appendSaveU32(bytes, (unsigned int)gMusicVolume);
+    appendSaveU32(bytes, gSoundEnabled.load() ? 1u : 0u);
+    appendSaveU32(bytes, gMusicEnabled ? 1u : 0u);
     appendSaveU32(bytes, fnv1aUpdate(2166136261u, &bytes[0], bytes.size()));
 
     const std::string temporaryPath = path + ".tmp";
@@ -2405,10 +2409,12 @@ static bool saveControlBindings() {
         LOGE("could not commit controller bindings");
         return false;
     }
-    LOGI("controller/video settings saved fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d blobShadows=%s",
+    LOGI("controller/video/audio settings saved fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d blobShadows=%s sound=%d/%s music=%d/%s",
          gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey, gMapKey,
-         gRenderPixelSizeX, gRenderPixelSizeY, gBlobShadowsEnabled ? "yes" : "no");
-    gLoadedControlVersion = 6u;
+         gRenderPixelSizeX, gRenderPixelSizeY, gBlobShadowsEnabled ? "yes" : "no",
+         gSoundVolume, gSoundEnabled.load() ? "on" : "off",
+         gMusicVolume, gMusicEnabled ? "on" : "off");
+    gLoadedControlVersion = 7u;
     return true;
 }
 
@@ -2419,7 +2425,8 @@ static bool loadControlBindings() {
     if (!file) return false;
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
     const long length = ftell(file);
-    if ((length != 36 && length != 40 && length != 44 && length != 48 && length != 52) ||
+    if ((length != 36 && length != 40 && length != 44 && length != 48 &&
+         length != 52 && length != 68) ||
         fseek(file, 0, SEEK_SET) != 0) { fclose(file); return false; }
     std::vector<unsigned char> bytes((size_t)length);
     const bool read = fread(&bytes[0], 1, bytes.size(), file) == bytes.size();
@@ -2433,11 +2440,13 @@ static bool loadControlBindings() {
     size_t offset = 8u;
     const unsigned int version = readSaveU32(bytes, offset, ok);
     if (!ok || (version != 1u && version != 2u && version != 3u &&
-                version != 4u && version != 5u && version != 6u)) return false;
+                version != 4u && version != 5u && version != 6u &&
+                version != 7u)) return false;
     if ((version == 1u && length != 36) || (version == 2u && length != 40) ||
         (version == 3u && length != 44) ||
         ((version == 4u || version == 5u) && length != 48) ||
-        (version == 6u && length != 52)) return false;
+        (version == 6u && length != 52) ||
+        (version == 7u && length != 68)) return false;
     const int bindings[5] = {
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
@@ -2472,9 +2481,28 @@ static bool loadControlBindings() {
         if (!ok || blobShadows > 1u) return false;
         gBlobShadowsEnabled = blobShadows != 0u;
     }
-    LOGI("controller/video settings loaded fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d blobShadows=%s version=%u",
+    gSoundVolume = 5;
+    gMusicVolume = 4;
+    gSoundEnabled.store(true);
+    gMusicEnabled = true;
+    if (version >= 7u) {
+        const unsigned int soundVolume = readSaveU32(bytes, offset, ok);
+        const unsigned int musicVolume = readSaveU32(bytes, offset, ok);
+        const unsigned int soundEnabled = readSaveU32(bytes, offset, ok);
+        const unsigned int musicEnabled = readSaveU32(bytes, offset, ok);
+        if (!ok || soundVolume < 1u || soundVolume > 5u ||
+            musicVolume < 1u || musicVolume > 5u ||
+            soundEnabled > 1u || musicEnabled > 1u) return false;
+        gSoundVolume = (int)soundVolume;
+        gMusicVolume = (int)musicVolume;
+        gSoundEnabled.store(soundEnabled != 0u);
+        gMusicEnabled = musicEnabled != 0u;
+    }
+    LOGI("controller/video/audio settings loaded fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d blobShadows=%s sound=%d/%s music=%d/%s version=%u",
          gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey, gMapKey,
-         gRenderPixelSizeX, gRenderPixelSizeY, gBlobShadowsEnabled ? "yes" : "no", version);
+         gRenderPixelSizeX, gRenderPixelSizeY, gBlobShadowsEnabled ? "yes" : "no",
+         gSoundVolume, gSoundEnabled.load() ? "on" : "off",
+         gMusicVolume, gMusicEnabled ? "on" : "off", version);
     gLoadedControlVersion = version;
     return true;
 }
@@ -7849,20 +7877,28 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         if (keyCode == 19) gSoundMenuSelection = (gSoundMenuSelection + 4) % 5;
         else if (keyCode == 20) gSoundMenuSelection = (gSoundMenuSelection + 1) % 5;
         else if (keyCode == 21 || keyCode == 22 || isConfirmKey(keyCode)) {
+            bool soundSettingsChanged = false;
             if (gSoundMenuSelection == 0) {
                 const int delta = keyCode == 21 ? -1 : 1;
                 gSoundVolume = std::max(1, std::min(5, gSoundVolume + delta));
+                soundSettingsChanged = true;
             } else if (gSoundMenuSelection == 1) {
                 const int delta = keyCode == 21 ? -1 : 1;
                 gMusicVolume = std::max(1, std::min(5, gMusicVolume + delta));
+                soundSettingsChanged = true;
             } else if (gSoundMenuSelection == 2) {
                 gSoundEnabled.store(!gSoundEnabled.load());
                 if (!gSoundEnabled.load()) {
                     std::lock_guard<std::mutex> lock(gAudioMutex);
                     gSoundVoices.clear();
                 }
-            } else if (gSoundMenuSelection == 3) gMusicEnabled = !gMusicEnabled;
+                soundSettingsChanged = true;
+            } else if (gSoundMenuSelection == 3) {
+                gMusicEnabled = !gMusicEnabled;
+                soundSettingsChanged = true;
+            }
             else setFrontendState(FRONTEND_MENU);
+            if (soundSettingsChanged) saveControlBindings();
         } else if (isBackKey(keyCode)) setFrontendState(FRONTEND_MENU);
         return;
     }
@@ -8056,15 +8092,26 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
     const int hy = (hatY > 0.5f) ? 1 : ((hatY < -0.5f) ? -1 : 0);
     if (hx != lastHatX) {
         if (gFrontendState == FRONTEND_SOUND && hx != 0) {
-            if (gSoundMenuSelection == 0) gSoundVolume = std::max(1, std::min(5, gSoundVolume + hx));
-            else if (gSoundMenuSelection == 1) gMusicVolume = std::max(1, std::min(5, gMusicVolume + hx));
+            bool soundSettingsChanged = false;
+            if (gSoundMenuSelection == 0) {
+                gSoundVolume = std::max(1, std::min(5, gSoundVolume + hx));
+                soundSettingsChanged = true;
+            } else if (gSoundMenuSelection == 1) {
+                gMusicVolume = std::max(1, std::min(5, gMusicVolume + hx));
+                soundSettingsChanged = true;
+            }
             else if (gSoundMenuSelection == 2) {
                 gSoundEnabled.store(!gSoundEnabled.load());
                 if (!gSoundEnabled.load()) {
                     std::lock_guard<std::mutex> lock(gAudioMutex);
                     gSoundVoices.clear();
                 }
-            } else if (gSoundMenuSelection == 3) gMusicEnabled = !gMusicEnabled;
+                soundSettingsChanged = true;
+            } else if (gSoundMenuSelection == 3) {
+                gMusicEnabled = !gMusicEnabled;
+                soundSettingsChanged = true;
+            }
+            if (soundSettingsChanged) saveControlBindings();
         } else if (gFrontendState == FRONTEND_PAUSE && hx != 0) {
             if (gPauseMenuSelection == 1) toggleRenderPixelSize();
             else if (gPauseMenuSelection == 2) toggleBlobShadows();

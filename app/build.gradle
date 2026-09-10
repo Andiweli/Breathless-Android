@@ -2,16 +2,17 @@ apply plugin: 'com.android.application'
 
 android {
     namespace 'com.ast.breathlessamiga'
-    // AGP 7.3.1 keeps this project compatible with Android Studio 2022 and
-    // Java 11. Its bundled AAPT2 cannot read the newer android-35 resource
-    // table, so resources compile against API 34 while the AAOS flavor still
-    // declares the Play-required targetSdk 35.
-    compileSdkVersion 34
+    // Google Play requires Android 16 / API 36 for this bundle. AGP 8.9.1 is
+    // the minimum officially supported Android Gradle Plugin for API 36.0.
+    compileSdkVersion 36
+    // NDK r23c is the final NDK release supporting Android 4.1 / API 16.
+    // Newer NDKs reject the OUYA flavor's native build.
+    ndkVersion '23.2.8568313'
 
     defaultConfig {
         applicationId 'com.ast.breathlessamiga'
-        versionCode 38
-        versionName '1.1'
+        versionCode 42
+        versionName '1.2'
 
         externalNativeBuild {
             cmake {
@@ -21,12 +22,19 @@ android {
 
     }
 
+    // AGP 8 disables BuildConfig generation unless explicitly requested.
+    // MainActivity uses BuildConfig.DEBUG to keep diagnostic logging out of
+    // release builds.
+    buildFeatures {
+        buildConfig true
+    }
+
     flavorDimensions 'platform'
     productFlavors {
         ouya {
             dimension 'platform'
             minSdkVersion 16
-            targetSdkVersion 28
+            targetSdkVersion 36
             ndk {
                 // One normal/OUYA APK also covers ARM64 and native x86_64
                 // Chromebooks without relying on ChromeOS ARM translation.
@@ -36,7 +44,7 @@ android {
         automotive {
             dimension 'platform'
             minSdkVersion 28
-            targetSdkVersion 35
+            targetSdkVersion 36
             ndk {
                 abiFilters 'arm64-v8a', 'x86_64'
             }
