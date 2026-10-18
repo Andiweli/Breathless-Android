@@ -33,6 +33,18 @@ This native Android port preserves the look, levels, gameplay and atmosphere of 
 
 [Download the appropriate APK](https://github.com/Andiweli/Breathless-Android/releases) for your platform or build one with Android Studio, then install it with Android's package installer. If required, allow installation from the app used to open the APK.
 
+## Support
+
+Further support is available on [Discord](https://discord.gg/AB3WVBqD5G).
+
+If you enjoy this project and would like to support my work, you can make a small contribution via PayPal.
+
+Your support helps me spend more time maintaining existing projects, fixing bugs, improving compatibility, and working on new features.
+
+[![Support via PayPal](https://img.shields.io/badge/Support%20via-PayPal-0070BA?logo=paypal&logoColor=white)](https://paypal.me/andiweli)
+
+Thank you for your support!
+
 ## Legal Notice
 
 Breathless and its original game content are copyright their respective authors and rights holders, including Fields of Vision and Power Computing Ltd. This is an unofficial, non-commercial fan-made Android port and is not affiliated with or endorsed by the original rights holders.
