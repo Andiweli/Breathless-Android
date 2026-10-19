@@ -37,8 +37,6 @@ This native Android port preserves the look, levels, gameplay and atmosphere of 
 
 ## Support
 
-Further support is available on [Discord](https://discord.gg/AB3WVBqD5G).
-
 If you enjoy this project and would like to support my work, you can make a small contribution via PayPal.
 
 Your support helps me spend more time maintaining existing projects, fixing bugs, improving compatibility, and working on new features.
