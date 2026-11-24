@@ -26,7 +26,8 @@ A short showreel can be [watched here](https://youtu.be/lxmx3KbsHKY).
 - Pixel sizing for low performance devices
 - Native aspect ratio on every display (16:9, 16:10, 4:3 …) with the HUD always at the bottom
 - First-person weapon that sways while walking, with an energy orb in the colour of the selected ammunition
-- Options menu with smoothing, depth of field, glow and lens flares
+- Options menu with mipmapping, smoothing, depth of field, glow and lens flares
+- Multi-core 3D renderer for smooth gameplay on OUYA and other quad-core devices
 
 ## Screenshots
 

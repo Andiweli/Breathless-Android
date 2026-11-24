@@ -16,6 +16,9 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <thread>
+#include <condition_variable>
+#include <unistd.h>
 
 // Keep the detailed reverse-engineering diagnostics in debug builds. Release
 // builds retain errors, but compile all informational/controller logs away.
@@ -30,10 +33,18 @@ static std::string gDataPath;
 static GLuint gProgram = 0, gTexture = 0, gVbo = 0;
 static int gTextureWidth = 0, gTextureHeight = 0;
 static GLint gPosLoc = -1, gUvLoc = -1, gTexLoc = -1, gScaleLoc = -1, gUvScaleLoc = -1;
-static GLint gWorldTexLoc = -1, gWorldTexelLoc = -1, gWorldScaleYLoc = -1, gSmoothLoc = -1, gDofLoc = -1;
-static GLint gBloomTexLoc = -1, gGlowLoc = -1, gFlareLoc = -1;
-static GLint gFlareLight0Loc = -1, gFlareLight1Loc = -1, gFlareAspectLoc = -1;
-static GLint gFlareTint0Loc = -1, gFlareTint1Loc = -1;
+// The screen shader is generated per combination of enabled post effects. With
+// every effect off (the default, and always on OUYA) the plain 1.2 shader runs:
+// Tegra 3 cannot branch in fragment shaders and evaluated every effect path of
+// a combined shader per pixel, which stalled and flickered the whole picture.
+static const unsigned int FX_SMOOTH = 1u, FX_DOF = 2u, FX_GLOW = 4u;
+struct ScreenProgram {
+    GLuint program = 0;
+    bool tried = false;
+    GLint pos = -1, uv = -1, tex = -1, scale = -1, uvScale = -1;
+    GLint world = -1, worldTexel = -1, worldScaleY = -1, bloom = -1;
+};
+static ScreenProgram gScreenPrograms[16];
 static GLuint gBloomTexture = 0;
 static int gBloomTextureWidth = 0, gBloomTextureHeight = 0;
 static GLuint gWorldTexture = 0;
@@ -139,7 +150,7 @@ static const int PAUSE_ENTRY_SPACING = 14;
 // Extra gap above QUIT TO TITLE, matching the title-to-first-entry gap.
 static const int PAUSE_GROUP_GAP = (PAUSE_FIRST_ENTRY_Y - PAUSE_TITLE_Y) - PAUSE_ENTRY_SPACING;
 static const int PAUSE_MAIN_ENTRIES = 4;
-static const int PAUSE_OPTION_ENTRIES = 7;
+static const int PAUSE_OPTION_ENTRIES = 8;
 
 struct WeaponSprite {
     int width = 0;
@@ -190,6 +201,11 @@ struct TextureBitmap {
     unsigned int height = 0;
     unsigned int frames = 1;
     bool ok = false;
+    // Software mipmaps (RGB, column-major like raw): levels 1..mipLevels for
+    // every animation frame; mipOffset[frame * mipLevels + level - 1].
+    std::vector<unsigned int> mip;
+    std::vector<size_t> mipOffset;
+    unsigned int mipLevels = 0;
 };
 
 struct GfxBitmap {
@@ -480,6 +496,7 @@ static int gRenderPixelSizeX = 1;
 static int gRenderPixelSizeY = 1;
 static bool gBlobShadowsEnabled = true;
 static bool gSmoothingEnabled = false;
+static bool gMipmapEnabled = true;
 static bool gDepthOfFieldEnabled = false;
 static bool gGlowEnabled = false;
 static bool gLensFlareEnabled = false;
@@ -628,6 +645,7 @@ static int gPlayerLookHorizonY = VIEW_CENTER_Y;
 static float gPlayerBobPhase = 0.0f;
 static float gPlayerBobOffset = 0.0f;
 static float gPlayerBobAmount = 0.0f; // display-only: weapon sway strength
+static int gPlayerStepParity = 0;     // display-only: flips with every footstep cycle
 static bool gPlayerFalling = false;
 static int gPlayerFallStartZ = 0;
 static int gPlayerHealth = 100;
@@ -1139,6 +1157,10 @@ static unsigned char sampleColumnMajorTexture(const std::vector<unsigned char>& 
     return texturePixelColumnMajor(raw, width, height, (unsigned int)xx, (unsigned int)yy);
 }
 
+// Read once per frame: sampling the system clock for every textured pixel was
+// both slow and unsafe to share between render threads.
+static double gTextureAnimSeconds = 0.0;
+
 static unsigned char sampleTextureBitmap(const TextureBitmap& tb, int x, int y) {
     if (!tb.ok || tb.width == 0 || tb.height == 0 || tb.raw.empty()) return 0;
     const unsigned int frameSize = tb.width * tb.height;
@@ -1146,7 +1168,7 @@ static unsigned char sampleTextureBitmap(const TextureBitmap& tb, int x, int y) 
     if (tb.frames > 1 && tb.raw.size() >= (size_t)frameSize * (size_t)tb.frames) {
         // Original TGLD textures can contain multiple animation brushes in one entry
         // (for example Blob/animated wall textures). Advance softly at ~8 fps.
-        frame = (unsigned int)(nowSeconds() * 8.0) % tb.frames;
+        frame = (unsigned int)(gTextureAnimSeconds * 8.0) % tb.frames;
     }
     const size_t base = (size_t)frame * (size_t)frameSize;
     int xx = x % (int)tb.width;
@@ -1158,6 +1180,88 @@ static unsigned char sampleTextureBitmap(const TextureBitmap& tb, int x, int y) 
     return tb.raw[pos];
 }
 
+static unsigned int textureFrame(const TextureBitmap& tb) {
+    const unsigned int frameSize = tb.width * tb.height;
+    if (tb.frames > 1 && tb.raw.size() >= (size_t)frameSize * (size_t)tb.frames)
+        return (unsigned int)(gTextureAnimSeconds * 8.0) % tb.frames;
+    return 0;
+}
+
+static unsigned int averageColors(unsigned int a, unsigned int b, unsigned int c, unsigned int d) {
+    unsigned int out = 0xff000000u;
+    for (int shift = 0; shift < 24; shift += 8) {
+        const unsigned int sum = ((a >> shift) & 0xffu) + ((b >> shift) & 0xffu) +
+                                 ((c >> shift) & 0xffu) + ((d >> shift) & 0xffu);
+        out |= ((sum + 2u) / 4u) << shift;
+    }
+    return out;
+}
+
+static unsigned int mixColors(unsigned int a, unsigned int b, float t) {
+    const unsigned int w = (unsigned int)(t * 256.0f + 0.5f), iw = 256u - w;
+    unsigned int out = 0xff000000u;
+    for (int shift = 0; shift < 24; shift += 8)
+        out |= ((((a >> shift) & 0xffu) * iw + ((b >> shift) & 0xffu) * w) >> 8) << shift;
+    return out;
+}
+
+// Builds box-filtered RGB mip levels (64 -> 32 -> 16 -> 8 -> 4 -> 2) for every
+// animation frame. Runs once per level load on the render thread.
+static void buildTextureMips(TextureBitmap& tb) {
+    tb.mip.clear();
+    tb.mipOffset.clear();
+    tb.mipLevels = 0;
+    if (!tb.ok || tb.width < 4 || tb.height < 4) return;
+    const size_t frameSize = (size_t)tb.width * tb.height;
+    const unsigned int frames = (tb.frames > 1 && tb.raw.size() >= frameSize * tb.frames) ? tb.frames : 1u;
+    if (tb.raw.size() < frameSize) return;
+    unsigned int levels = 0;
+    while (levels < 5 && (tb.width >> (levels + 1)) >= 2 && (tb.height >> (levels + 1)) >= 2) ++levels;
+    if (levels == 0) return;
+    tb.mipLevels = levels;
+    std::vector<unsigned int> previous, current;
+    for (unsigned int frame = 0; frame < frames; ++frame) {
+        unsigned int w = tb.width, h = tb.height;
+        previous.resize(frameSize);
+        for (size_t i = 0; i < frameSize; ++i) previous[i] = paletteColor(tb.raw[(size_t)frame * frameSize + i]);
+        for (unsigned int level = 1; level <= levels; ++level) {
+            const unsigned int nw = w / 2, nh = h / 2;
+            current.resize((size_t)nw * nh);
+            for (unsigned int x = 0; x < nw; ++x) for (unsigned int y = 0; y < nh; ++y) {
+                const size_t a = (size_t)(2 * x) * h + 2 * y;
+                const size_t b = (size_t)(2 * x + 1) * h + 2 * y;
+                current[(size_t)x * nh + y] = averageColors(previous[a], previous[a + 1], previous[b], previous[b + 1]);
+            }
+            tb.mipOffset.push_back(tb.mip.size());
+            tb.mip.insert(tb.mip.end(), current.begin(), current.end());
+            previous.swap(current);
+            w = nw; h = nh;
+        }
+    }
+}
+
+static unsigned int mipTexel(const TextureBitmap& tb, unsigned int frame, unsigned int level, int x, int y) {
+    const int w = std::max(1, (int)(tb.width >> level)), h = std::max(1, (int)(tb.height >> level));
+    int xx = (x >> (int)level) % w, yy = (y >> (int)level) % h;
+    if (xx < 0) xx += w;
+    if (yy < 0) yy += h;
+    return tb.mip[tb.mipOffset[(size_t)frame * tb.mipLevels + level - 1u] + (size_t)xx * (size_t)h + (size_t)yy];
+}
+
+// Texture colour with trilinear mip filtering: the further a surface is (more
+// texels per screen pixel), the softer the averaged level that is read.
+static unsigned int sampleTextureColor(const TextureBitmap& tb, int x, int y, float texelsPerPixel) {
+    if (!gMipmapEnabled || tb.mipLevels == 0 || texelsPerPixel <= 1.0f || tb.mipOffset.empty())
+        return paletteColor(sampleTextureBitmap(tb, x, y));
+    const float lod = std::min((float)tb.mipLevels, log2f(texelsPerPixel));
+    const unsigned int l0 = (unsigned int)lod;
+    const float t = lod - (float)l0;
+    const unsigned int frame = std::min(textureFrame(tb), (unsigned int)(tb.mipOffset.size() / tb.mipLevels) - 1u);
+    const unsigned int c0 = l0 == 0 ? paletteColor(sampleTextureBitmap(tb, x, y)) : mipTexel(tb, frame, l0, x, y);
+    if (l0 >= tb.mipLevels || t < 0.03f) return c0;
+    return mixColors(c0, mipTexel(tb, frame, l0 + 1u, x, y), t);
+}
+
 static unsigned int shadeColor(unsigned int col, int light) {
     if (light < 24) light = 24;
     if (light > 256) light = 256;
@@ -1166,12 +1270,27 @@ static unsigned int shadeColor(unsigned int col, int light) {
     return 0xff000000u | (b << 16) | (g << 8) | r;
 }
 
+// Frame timing (logged only in builds with LOGI enabled): world = software
+// 3-D renderer, compose = weapon/HUD/effects, gpu = upload + draw calls.
+static double gPerfWorld = 0.0, gPerfCompose = 0.0, gPerfGpu = 0.0;
+static unsigned gPerfFrames = 0;
+static double gPerfLastLog = 0.0;
+
 static void updateFps() {
     const double t = nowSeconds();
     if (gFpsLastTime == 0.0) gFpsLastTime = t;
     ++gFpsFrames;
     const double dt = t - gFpsLastTime;
     if (dt >= 0.50) { gFps = (double)gFpsFrames / dt; gFpsFrames = 0; gFpsLastTime = t; }
+    if (gPerfLastLog == 0.0) gPerfLastLog = t;
+    if (t - gPerfLastLog >= 3.0 && gPerfFrames > 0) {
+        LOGI("perf fps=%.1f world=%.1fms compose=%.1fms gpu=%.1fms fb=%dx%d pixel=%dx%d",
+             gFps, gPerfWorld * 1000.0 / gPerfFrames, gPerfCompose * 1000.0 / gPerfFrames,
+             gPerfGpu * 1000.0 / gPerfFrames, FB_W, FB_H, gRenderPixelSizeX, gRenderPixelSizeY);
+        gPerfWorld = gPerfCompose = gPerfGpu = 0.0;
+        gPerfFrames = 0;
+        gPerfLastLog = t;
+    }
 }
 
 static std::string trimRightSpaces(std::string v) {
@@ -2473,7 +2592,7 @@ static bool saveControlBindings() {
     std::vector<unsigned char> bytes;
     static const unsigned char magic[8] = {'B','L','C','T','R','L','0','1'};
     bytes.insert(bytes.end(), magic, magic + sizeof(magic));
-    appendSaveU32(bytes, 9u);
+    appendSaveU32(bytes, 10u);
     appendSaveU32(bytes, (unsigned int)gFireKey);
     appendSaveU32(bytes, (unsigned int)gActivateKey);
     appendSaveU32(bytes, (unsigned int)gWeaponKey);
@@ -2491,6 +2610,7 @@ static bool saveControlBindings() {
     appendSaveU32(bytes, gDepthOfFieldEnabled ? 1u : 0u);
     appendSaveU32(bytes, gGlowEnabled ? 1u : 0u);
     appendSaveU32(bytes, gLensFlareEnabled ? 1u : 0u);
+    appendSaveU32(bytes, gMipmapEnabled ? 1u : 0u);
     appendSaveU32(bytes, fnv1aUpdate(2166136261u, &bytes[0], bytes.size()));
 
     const std::string temporaryPath = path + ".tmp";
@@ -2508,7 +2628,7 @@ static bool saveControlBindings() {
          gRenderPixelSizeX, gRenderPixelSizeY, gBlobShadowsEnabled ? "yes" : "no",
          gSoundVolume, gSoundEnabled.load() ? "on" : "off",
          gMusicVolume, gMusicEnabled ? "on" : "off");
-    gLoadedControlVersion = 9u;
+    gLoadedControlVersion = 10u;
     return true;
 }
 
@@ -2520,7 +2640,7 @@ static bool loadControlBindings() {
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
     const long length = ftell(file);
     if ((length != 36 && length != 40 && length != 44 && length != 48 &&
-         length != 52 && length != 68 && length != 76 && length != 84) ||
+         length != 52 && length != 68 && length != 76 && length != 84 && length != 88) ||
         fseek(file, 0, SEEK_SET) != 0) { fclose(file); return false; }
     std::vector<unsigned char> bytes((size_t)length);
     const bool read = fread(&bytes[0], 1, bytes.size(), file) == bytes.size();
@@ -2535,14 +2655,15 @@ static bool loadControlBindings() {
     const unsigned int version = readSaveU32(bytes, offset, ok);
     if (!ok || (version != 1u && version != 2u && version != 3u &&
                 version != 4u && version != 5u && version != 6u &&
-                version != 7u && version != 8u && version != 9u)) return false;
+                version != 7u && version != 8u && version != 9u && version != 10u)) return false;
     if ((version == 1u && length != 36) || (version == 2u && length != 40) ||
         (version == 3u && length != 44) ||
         ((version == 4u || version == 5u) && length != 48) ||
         (version == 6u && length != 52) ||
         (version == 7u && length != 68) ||
         (version == 8u && length != 76) ||
-        (version == 9u && length != 84)) return false;
+        (version == 9u && length != 84) ||
+        (version == 10u && length != 88)) return false;
     const int bindings[5] = {
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
@@ -2611,6 +2732,12 @@ static bool loadControlBindings() {
         if (!ok || glow > 1u || lensFlare > 1u) return false;
         gGlowEnabled = glow != 0u;
         gLensFlareEnabled = lensFlare != 0u;
+    }
+    gMipmapEnabled = true;
+    if (version >= 10u) {
+        const unsigned int mipmapping = readSaveU32(bytes, offset, ok);
+        if (!ok || mipmapping > 1u) return false;
+        gMipmapEnabled = mipmapping != 0u;
     }
     LOGI("controller/video/audio settings loaded fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d blobShadows=%s sound=%d/%s music=%d/%s version=%u",
          gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey, gMapKey,
@@ -3238,84 +3365,151 @@ static GLuint linkProgram(const char* vs, const char* fs) {
     glDeleteShader(v); glDeleteShader(f);
     GLint linked = 0;
     glGetProgramiv(program, GL_LINK_STATUS, &linked);
-    if (!linked) LOGE("shader program link failed");
+    if (!linked) {
+        LOGE("shader program link failed");
+        glDeleteProgram(program);
+        return 0;
+    }
     return program;
+}
+
+static const char* kScreenVs = "attribute vec2 aPos; attribute vec2 aUv; uniform vec2 uScale; varying vec2 vUv; void main(){ vUv=aUv; gl_Position=vec4(aPos*uScale,0.0,1.0); }";
+
+static std::string screenFragmentSource(unsigned int fx) {
+    std::string s = "precision mediump float; varying vec2 vUv; uniform sampler2D uTex; uniform vec2 uUvScale;";
+    if (fx != 0u) s += "uniform float uWorldScaleY;";
+    if (fx & (FX_SMOOTH | FX_DOF)) s += "uniform sampler2D uWorld;";
+    if (fx & FX_DOF) s += "uniform vec2 uWorldTexel;";
+    if (fx & FX_GLOW) s += "uniform sampler2D uBloom;";
+    s += "void main(){"
+         " vec2 uv=clamp((vUv-vec2(0.5))/uUvScale+vec2(0.5),vec2(0.0),vec2(1.0));"
+         " vec4 c=texture2D(uTex,uv);";
+    if (fx == 0u) return s + " gl_FragColor=vec4(c.rgb,1.0); }";
+    s += " vec3 col=c.rgb; float wy=uv.y*uWorldScaleY;"
+         " if(wy<1.0){ vec2 wuv=vec2(uv.x,wy);";
+    // World pixels (alpha < 0xff) may be smoothed and blurred by their encoded
+    // depth; HUD, weapon and text keep alpha 0xff and stay pixel-exact.
+    if (fx & (FX_SMOOTH | FX_DOF)) s += "  if(c.a<0.97){";
+    if (fx & FX_SMOOTH) s += "   col=texture2D(uWorld,wuv).rgb;";
+    if (fx & FX_DOF) {
+        // Blur amount from the bilinearly filtered depth and a bilinear base colour,
+        // so no game pixel shows as a square; four taps on a rotated grid.
+        s += "   vec4 w0=texture2D(uWorld,wuv);"
+             "   float blur=smoothstep(0.19,0.62,w0.a*(255.0/240.0));"
+             "   vec2 o=uWorldTexel;"
+             "   vec3 b=(texture2D(uWorld,wuv+vec2(-1.5*o.x,-0.5*o.y)).rgb+texture2D(uWorld,wuv+vec2(1.5*o.x,0.5*o.y)).rgb+"
+             "           texture2D(uWorld,wuv+vec2(0.5*o.x,-1.5*o.y)).rgb+texture2D(uWorld,wuv+vec2(-0.5*o.x,1.5*o.y)).rgb)*0.25;"
+             "   col=mix(col,mix(w0.rgb,b,blur),min(1.0,blur*2.5));";
+    }
+    if (fx & (FX_SMOOTH | FX_DOF)) s += "  }";
+    if (fx & FX_GLOW) s += "  col+=texture2D(uBloom,wuv).rgb*1.5;";
+    return s + " } gl_FragColor=vec4(col,1.0); }";
+}
+
+// Lens flare ghosts as in CubeEvil4 (gx_fixed_shaders.h kFlareVs/kFlareFs): each
+// ghost is one small additive quad, so the GPU shades only the pixels a ghost
+// covers. A full-screen flare shader overloaded the OUYA's Tegra 3.
+static GLuint gFlareProgram = 0;
+static bool gFlareProgramTried = false;
+static GLint gFlarePosLoc = -1, gFlareRectLoc = -1, gFlareColorLoc = -1, gFlareKindLoc = -1;
+
+static void drawLensFlareGhosts() {
+    if (!gFlareProgramTried) {
+        gFlareProgramTried = true;
+        const char* vs = "attribute vec2 aPos; uniform vec4 uRect; varying vec2 vUv;"
+                         "void main(){ vUv=aPos; gl_Position=vec4(uRect.xy+aPos*uRect.zw,0.0,1.0); }";
+        const char* fs =
+            "precision mediump float; varying vec2 vUv; uniform vec3 uColor; uniform float uKind;"
+            "void main(){ float d=length(vUv); if(d>=1.0) discard; float f;"
+            " if(uKind>2.5 && uKind<3.5 || uKind>4.5){"
+            "  vec2 h=abs(vUv); float hex=max(h.x*0.866+h.y*0.5,h.y);"
+            "  f=(1.0-smoothstep(0.84,0.98,hex))*0.55+smoothstep(0.74,0.88,hex)*(1.0-smoothstep(0.88,0.98,hex))*0.8;"
+            " } else if(uKind>3.5) f=(1.0-smoothstep(0.86,1.0,d))*smoothstep(0.62,0.84,d)+(1.0-d)*0.25;"
+            " else f=1.0-smoothstep(0.2,1.0,d);"
+            " gl_FragColor=vec4(uColor*f,0.0); }";
+        gFlareProgram = linkProgram(vs, fs);
+        if (gFlareProgram) {
+            gFlarePosLoc = glGetAttribLocation(gFlareProgram, "aPos");
+            gFlareRectLoc = glGetUniformLocation(gFlareProgram, "uRect");
+            gFlareColorLoc = glGetUniformLocation(gFlareProgram, "uColor");
+            gFlareKindLoc = glGetUniformLocation(gFlareProgram, "uKind");
+        }
+    }
+    if (!gFlareProgram || gFlarePosLoc < 0 || gViewW <= 0 || gViewH <= 0) return;
+    // centre factor g.x, radius g.y (view heights), strength g.z, shape, colour
+    static const float ghosts[5][7] = {
+        { 0.42f, 0.030f, 0.18f, 1.0f, 0.35f, 1.00f, 0.55f},
+        { 0.18f, 0.016f, 0.22f, 2.0f, 1.00f, 0.72f, 0.35f},
+        {-0.30f, 0.055f, 0.13f, 3.0f, 0.72f, 0.42f, 1.00f},
+        {-0.62f, 0.024f, 0.20f, 4.0f, 0.35f, 0.62f, 1.00f},
+        {-1.05f, 0.080f, 0.09f, 5.0f, 0.40f, 0.95f, 0.85f}
+    };
+    const float viewFraction = (float)VIEW_H / (float)std::max(1, FB_H);
+    const float viewAspect = (float)FB_W / (float)std::max(1, VIEW_H);
+    const int viewPixels = (int)floorf((float)gViewH * viewFraction + 0.5f);
+    glUseProgram(gFlareProgram);
+    glBindBuffer(GL_ARRAY_BUFFER, gVbo);
+    glEnableVertexAttribArray(gFlarePosLoc);
+    glVertexAttribPointer(gFlarePosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)0);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, gViewH - viewPixels, gViewW, viewPixels); // never over the HUD
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
+    for (int i = 0; i < FLARE_LIGHTS; ++i) {
+        const FlareLight& light = gFlareLights[i];
+        const float strength = light.intensity * gFlareFade;
+        if (strength <= 0.003f) continue;
+        const float offX = light.x - 0.5f, offY = light.y - 0.5f;
+        const float grow = 0.8f + 0.4f * sqrtf(offX * viewAspect * offX * viewAspect + offY * offY);
+        for (int g = 0; g < 5; ++g) {
+            const float cx = 0.5f + offX * ghosts[g][0];
+            const float cy = 0.5f + offY * ghosts[g][0];
+            const float radius = ghosts[g][1] * grow;
+            const float k = ghosts[g][2] * 0.8f * strength;
+            glUniform4f(gFlareRectLoc, cx * 2.0f - 1.0f, 1.0f - 2.0f * cy * viewFraction,
+                        2.0f * radius * viewFraction * (float)gViewH / (float)gViewW,
+                        2.0f * radius * viewFraction);
+            glUniform3f(gFlareColorLoc,
+                        (ghosts[g][4] * 0.75f + light.r * 0.25f) * k,
+                        (ghosts[g][5] * 0.75f + light.g * 0.25f) * k,
+                        (ghosts[g][6] * 0.75f + light.b * 0.25f) * k);
+            glUniform1f(gFlareKindLoc, ghosts[g][3]);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+    }
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+static const ScreenProgram& screenProgram(unsigned int fx) {
+    ScreenProgram& p = gScreenPrograms[fx & 15u];
+    if (!p.tried) {
+        p.tried = true;
+        const std::string fs = screenFragmentSource(fx & 15u);
+        p.program = linkProgram(kScreenVs, fs.c_str());
+        if (p.program) {
+            p.pos = glGetAttribLocation(p.program, "aPos"); p.uv = glGetAttribLocation(p.program, "aUv");
+            p.tex = glGetUniformLocation(p.program, "uTex"); p.scale = glGetUniformLocation(p.program, "uScale");
+            p.uvScale = glGetUniformLocation(p.program, "uUvScale");
+            p.world = glGetUniformLocation(p.program, "uWorld"); p.worldTexel = glGetUniformLocation(p.program, "uWorldTexel");
+            p.worldScaleY = glGetUniformLocation(p.program, "uWorldScaleY"); p.bloom = glGetUniformLocation(p.program, "uBloom");
+        } else {
+            LOGE("screen shader variant %u unavailable; using the plain shader", fx & 15u);
+        }
+    }
+    if (!p.program && (fx & 15u) != 0u) return screenProgram(0u);
+    return p;
 }
 
 static void ensureGl() {
     if (gProgram) return;
-    const char* vs = "attribute vec2 aPos; attribute vec2 aUv; uniform vec2 uScale; varying vec2 vUv; void main(){ vUv=aUv; gl_Position=vec4(aPos*uScale,0.0,1.0); }";
-    // World pixels (alpha < 0xff) may be replaced by the bilinear world-only
-    // texture (smoothing) and blurred by their encoded depth (depth of field).
-    // HUD, weapon and text keep alpha 0xff and are always shown pixel-exact.
-    const char* fs =
-        "precision mediump float; varying vec2 vUv; uniform sampler2D uTex; uniform sampler2D uWorld;"
-        "uniform sampler2D uBloom; uniform float uGlow; uniform float uFlare;"
-        "uniform vec2 uUvScale; uniform vec2 uWorldTexel; uniform float uWorldScaleY; uniform float uSmooth; uniform float uDof;"
-        // Lens flare ghosts as in CubeEvil4 (gx_fixed_shaders.h kFlareVs/kFlareFs): five ghosts at
-        // centre + (light - centre) * g.x, radius g.y of the view height (growing a little with the
-        // light's distance from the centre), strength g.z; soft discs, aperture hexagons and one ring,
-        // coloured 75 % by the ghost and 25 % by the light. Added faintly, at most about a tenth.
-        "uniform vec4 uLight0; uniform vec4 uLight1; uniform vec3 uTint0; uniform vec3 uTint1; uniform float uAspect;"
-        "float ghostShape(vec2 p, vec2 c, float r, float kind){"
-        " vec2 u=p-c; u.x*=uAspect; u/=r; float d=length(u);"
-        " if(d>=1.0) return 0.0;"
-        " if(kind>2.5 && kind<3.5 || kind>4.5){"
-        "  vec2 h=abs(u); float hex=max(h.x*0.866+h.y*0.5,h.y);"
-        "  return (1.0-smoothstep(0.84,0.98,hex))*0.55+smoothstep(0.74,0.88,hex)*(1.0-smoothstep(0.88,0.98,hex))*0.8;"
-        " }"
-        " if(kind>3.5) return (1.0-smoothstep(0.86,1.0,d))*smoothstep(0.62,0.84,d)+(1.0-d)*0.25;"
-        " return 1.0-smoothstep(0.2,1.0,d);"
-        "}"
-        "vec3 lensFlare(vec2 p, vec4 L, vec3 tint){"
-        " if(L.z<=0.003) return vec3(0.0);"
-        " vec2 m=vec2(0.5); vec2 off=L.xy-m;"
-        " vec2 oa=off; oa.x*=uAspect;"
-        " float grow=0.8+0.4*length(oa);"
-        " vec3 f=ghostShape(p,m+off*0.42,0.030*grow,1.0)*mix(vec3(0.35,1.0,0.55),tint,0.25)*0.18"
-        "       +ghostShape(p,m+off*0.18,0.016*grow,2.0)*mix(vec3(1.0,0.72,0.35),tint,0.25)*0.22"
-        "       +ghostShape(p,m-off*0.30,0.055*grow,3.0)*mix(vec3(0.72,0.42,1.0),tint,0.25)*0.13"
-        "       +ghostShape(p,m-off*0.62,0.024*grow,4.0)*mix(vec3(0.35,0.62,1.0),tint,0.25)*0.20"
-        "       +ghostShape(p,m-off*1.05,0.080*grow,5.0)*mix(vec3(0.40,0.95,0.85),tint,0.25)*0.09;"
-        " return f*L.z*0.8;"
-        "}"
-        "void main(){"
-        " vec2 uv=clamp((vUv-vec2(0.5))/uUvScale+vec2(0.5),vec2(0.0),vec2(1.0));"
-        " vec4 c=texture2D(uTex,uv); vec3 col=c.rgb;"
-        " float wy=uv.y*uWorldScaleY;"
-        " if(wy<1.0 && (uSmooth>0.5 || uDof>0.5 || uGlow>0.5 || uFlare>0.5)){"
-        "  vec2 wuv=vec2(uv.x,wy);"
-        "  if(c.a<0.97){"
-        "   if(uSmooth>0.5) col=texture2D(uWorld,wuv).rgb;"
-        // The blur amount comes from the bilinearly filtered depth (world texture alpha)
-        // and the base colour turns bilinear as soon as blurring starts: the nearest
-        // texel's colour and depth would otherwise leave every game pixel as a square.
-        // Four bilinear taps on a rotated grid give a soft, grid-free kernel.
-        "   if(uDof>0.5){"
-        "    vec4 w0=texture2D(uWorld,wuv);"
-        "    float blur=smoothstep(0.19,0.62,w0.a*(255.0/240.0));"
-        "    if(blur>0.001){"
-        "     vec2 o=uWorldTexel;"
-        "     vec3 b=(texture2D(uWorld,wuv+vec2(-1.5*o.x,-0.5*o.y)).rgb+texture2D(uWorld,wuv+vec2(1.5*o.x,0.5*o.y)).rgb+"
-        "             texture2D(uWorld,wuv+vec2(0.5*o.x,-1.5*o.y)).rgb+texture2D(uWorld,wuv+vec2(-0.5*o.x,1.5*o.y)).rgb)*0.25;"
-        "     col=mix(col,mix(w0.rgb,b,blur),min(1.0,blur*2.5));"
-        "    }"
-        "   }"
-        "  }"
-        "  if(uGlow>0.5) col+=texture2D(uBloom,wuv).rgb*1.5;"
-        "  if(uFlare>0.5){"
-        "   col+=lensFlare(wuv,uLight0,uTint0)+lensFlare(wuv,uLight1,uTint1);"
-        "  }"
-        " }"
-        " gl_FragColor=vec4(col,1.0); }";
-    gProgram = linkProgram(vs, fs);
-    gPosLoc = glGetAttribLocation(gProgram, "aPos"); gUvLoc = glGetAttribLocation(gProgram, "aUv"); gTexLoc = glGetUniformLocation(gProgram, "uTex"); gScaleLoc = glGetUniformLocation(gProgram, "uScale"); gUvScaleLoc = glGetUniformLocation(gProgram, "uUvScale");
-    gWorldTexLoc = glGetUniformLocation(gProgram, "uWorld"); gWorldTexelLoc = glGetUniformLocation(gProgram, "uWorldTexel");
-    gWorldScaleYLoc = glGetUniformLocation(gProgram, "uWorldScaleY"); gSmoothLoc = glGetUniformLocation(gProgram, "uSmooth"); gDofLoc = glGetUniformLocation(gProgram, "uDof");
-    gBloomTexLoc = glGetUniformLocation(gProgram, "uBloom"); gGlowLoc = glGetUniformLocation(gProgram, "uGlow"); gFlareLoc = glGetUniformLocation(gProgram, "uFlare");
-    gFlareLight0Loc = glGetUniformLocation(gProgram, "uLight0"); gFlareLight1Loc = glGetUniformLocation(gProgram, "uLight1");
-    gFlareAspectLoc = glGetUniformLocation(gProgram, "uAspect");
-    gFlareTint0Loc = glGetUniformLocation(gProgram, "uTint0"); gFlareTint1Loc = glGetUniformLocation(gProgram, "uTint1");
+    for (int i = 0; i < 16; ++i) gScreenPrograms[i] = ScreenProgram();
+    gFlareProgram = 0;
+    gFlareProgramTried = false;
+    const ScreenProgram& plain = screenProgram(0u);
+    gProgram = plain.program;
+    gPosLoc = plain.pos; gUvLoc = plain.uv; gTexLoc = plain.tex; gScaleLoc = plain.scale; gUvScaleLoc = plain.uvScale;
+    const char* vs = kScreenVs;
     const char* overlayFs = "precision mediump float; varying vec2 vUv; uniform sampler2D uTex; void main(){ gl_FragColor=texture2D(uTex,vUv); }";
     gOverlayProgram = linkProgram(vs, overlayFs);
     gOverlayPosLoc = glGetAttribLocation(gOverlayProgram, "aPos"); gOverlayUvLoc = glGetAttribLocation(gOverlayProgram, "aUv");
@@ -5110,6 +5304,8 @@ static void ensureLevelTextureCache() {
         }
         if (loadExactSwitchTextureResource(fullPath, ai->lgldTextureList[i], gLevelSwitchTextureCache[i + 1u]))
             ++switchCount;
+        buildTextureMips(gLevelTextureCache[i + 1u]);
+        buildTextureMips(gLevelSwitchTextureCache[i + 1u]);
     }
     LOGI("level textures asset=%s names=%u loaded=%u animated=%u switches=%u first=%s",
          ai->name.c_str(), (unsigned int)ai->lgldTextureList.size(), okCount, animCount,
@@ -5362,6 +5558,10 @@ static void updatePlayerMotion() {
         gPlayerBobPhase = fmodf(previousPhase +
             phaseDirection * phaseStepsPerSecond * (float)dt, 64.0f);
         if (gPlayerBobPhase < 0.0f) gPlayerBobPhase += 64.0f;
+        // One bob waveform is one footstep. The weapon swings to alternate
+        // sides, so its sway spans two waveforms; count completed ones.
+        if (walkingBackward ? gPlayerBobPhase > previousPhase : gPlayerBobPhase < previousPhase)
+            gPlayerStepParity ^= 1;
 
         // movement.asm plays GlobalSound5 once per walking waveform. Forward
         // movement enters the original >=50 gate; backward movement decrements
@@ -5889,47 +6089,43 @@ static const TextureBitmap* currentLevelSkyTexture() {
     return nullptr;
 }
 
-static void drawSkyBackground() {
-    // v33: Breathless outdoor levels use a wider panoramic sky feel.
-    // v32 rotated the sky too slowly in open WLD1 areas, especially around BLES0008/map8.
-    // Keep this isolated from wall/floor texture binding so only sky pan behaviour changes.
-    const int horizon = currentViewHorizonY();
+struct SkyParams {
+    const TextureBitmap* texture = nullptr;
+    int lookOffset = 0;
+    int pixelSizeY = 1;
+};
+
+static SkyParams currentSkyParams() {
+    SkyParams params;
     // Anchor the panorama at the horizon with its original 80-line scale. A
     // taller view therefore shows more of the upper sky instead of stretching.
-    const int lookOffset = horizon - BASE_VIEW_CENTER_Y;
-    const TextureBitmap* activeSky = currentLevelSkyTexture();
-    if (!activeSky || !activeSky->ok) activeSky = &gSkyTex;
-    const int pixelSizeX = std::max(1, std::min(2, gRenderPixelSizeX));
-    const int pixelSizeY = std::max(1, std::min(2, gRenderPixelSizeY));
-    for (int y = 0; y < horizon; y += pixelSizeY) for (int x = 0; x < FB_W; x += pixelSizeX) {
-        if (activeSky->ok) {
-            // Preserve the established 16:9 angular scale in the centre and
-            // reveal more wrapped sky on wider framebuffers. Dividing by the
-            // dynamic width would stretch one sky panorama over every aspect.
-            const int centeredX = x - (FB_W - BASE_FB_W) / 2;
-            const float sx = (float)centeredX * (float)activeSky->width / (float)BASE_FB_W +
-                             gPlayerA * SKY_SCROLL_SCALE_V33;
-            const int sourceY = y + (pixelSizeY - 1) / 2 - lookOffset;
-            int sy = (int)((sourceY * (int)activeSky->height * SKY_VERTICAL_SCALE_V33) / BASE_VIEW_CENTER_Y);
-            if (sy < 0) sy = 0;
-            if (sy >= (int)activeSky->height) sy = (int)activeSky->height - 1;
-            // The source panoramas are clean. Fractional horizontal sampling
-            // prevents duplicated source columns from becoming vertical cloud
-            // streaks when 256-pixel skies are expanded to wide Android views.
-            const unsigned int color = sampleSkyColorFiltered(*activeSky, sx, sy);
-            for (int py = y; py < std::min(horizon, y + pixelSizeY); ++py)
-                for (int px = x; px < std::min(FB_W, x + pixelSizeX); ++px)
-                    gFramebuffer[py * FB_W + px] = color;
-        } else {
-            int v = 72 + (std::max(0, y - lookOffset) * 64) / BASE_VIEW_CENTER_Y;
-            if (v > 136) v = 136;
-            const unsigned int color = 0xff000000u | ((unsigned)v << 16) |
-                ((unsigned)(v / 2) << 8) | (unsigned)(v / 3);
-            for (int py = y; py < std::min(horizon, y + pixelSizeY); ++py)
-                for (int px = x; px < std::min(FB_W, x + pixelSizeX); ++px)
-                    gFramebuffer[py * FB_W + px] = color;
-        }
+    params.lookOffset = currentViewHorizonY() - BASE_VIEW_CENTER_Y;
+    params.texture = currentLevelSkyTexture();
+    if (!params.texture || !params.texture->ok) params.texture = &gSkyTex;
+    params.pixelSizeY = std::max(1, std::min(2, gRenderPixelSizeY));
+    return params;
+}
+
+// v33 panoramic sky for the pixel block starting at (x, y). Only evaluated for
+// pixels no wall, ceiling or floor covered (see renderWorldColumns): filtering
+// the whole upper half every frame cost more than the complete 3-D view.
+static unsigned int skyColorAt(const SkyParams& sky, int x, int y) {
+    const TextureBitmap& texture = *sky.texture;
+    if (texture.ok) {
+        // Preserve the established 16:9 angular scale in the centre and
+        // reveal more wrapped sky on wider framebuffers.
+        const int centeredX = x - (FB_W - BASE_FB_W) / 2;
+        const float sx = (float)centeredX * (float)texture.width / (float)BASE_FB_W +
+                         gPlayerA * SKY_SCROLL_SCALE_V33;
+        const int sourceY = y + (sky.pixelSizeY - 1) / 2 - sky.lookOffset;
+        int sy = (int)((sourceY * (int)texture.height * SKY_VERTICAL_SCALE_V33) / BASE_VIEW_CENTER_Y);
+        if (sy < 0) sy = 0;
+        if (sy >= (int)texture.height) sy = (int)texture.height - 1;
+        return sampleSkyColorFiltered(texture, sx, sy);
     }
+    int v = 72 + (std::max(0, y - sky.lookOffset) * 64) / BASE_VIEW_CENTER_Y;
+    if (v > 136) v = 136;
+    return 0xff000000u | ((unsigned)v << 16) | ((unsigned)(v / 2) << 8) | (unsigned)(v / 3);
 }
 
 static void drawFloorAndCeiling() {
@@ -6169,7 +6365,7 @@ static void __attribute__((unused)) drawRoomRendererLegacy() {
     updateOriginalVTableProbe();
     updateOriginalSpanPrepProbe();
     updateHeightRayProbe();
-    drawSkyBackground();
+    // (sky: now drawn per column by renderWorldColumns)
     drawFloorAndCeiling();
     // v63: keep original span prep/probe logging, but do not draw those spans yet.
     // The visible OTable approximation from v49 was too inaccurate and made the
@@ -6278,6 +6474,8 @@ static void drawPortalPlaneSegment(int x, int y0, int y1, float rayX, float rayY
     y0 = std::max(0, y0);
     y1 = std::min(VIEW_H - 1, y1);
     const int pixelSize = std::max(1, std::min(2, gRenderPixelSizeY));
+    const int pixelSizeX = std::max(1, std::min(2, gRenderPixelSizeX));
+    const float columnStep = 2.0f * cameraPlaneScale() / (float)FB_W; // map cells per column at distance 1
     for (int blockY = y0; blockY <= y1;) {
         const int blockEnd = std::min(y1, pixelSize == 2 ? ((blockY | 1)) : blockY);
         const int y = (blockY + blockEnd) / 2;
@@ -6296,9 +6494,13 @@ static void drawPortalPlaneSegment(int x, int y0, int y1, float rayX, float rayY
         }
         const float wx = gPlayerX + rayX * distance;
         const float wy = gPlayerY + rayY * distance;
-        const unsigned char paletteIndex = sampleTextureBitmap(*texture,
-            (int)floorf(wx * (float)texture->width), (int)floorf(wy * (float)texture->height));
-        const unsigned int color = shadeColor(paletteColor(paletteIndex), blockLightAt(block, distance, 0));
+        // Texels per screen pixel: across (one column) and along (one row) the
+        // plane; their geometric mean softens grazing floors without smearing them.
+        const float acrossTexels = distance * columnStep * (float)texture->width * (float)pixelSizeX;
+        const float alongTexels = distance / denom * (float)texture->width * (float)pixelSize;
+        const unsigned int color = shadeColor(sampleTextureColor(*texture,
+            (int)floorf(wx * (float)texture->width), (int)floorf(wy * (float)texture->height),
+            sqrtf(acrossTexels * alongTexels)), blockLightAt(block, distance, 0));
         for (int py = blockY; py <= blockEnd; ++py) if (!filled[py]) {
             gFramebuffer[py * FB_W + x] = color;
             gWallDepth[(size_t)py * FB_W + (size_t)x] = distance;
@@ -6357,6 +6559,7 @@ static void drawPortalWallSegment(int x, int y0, int y1, float distance, int bru
     if (y0 > y1) return;
     int texX = brushOffset * (int)texture->width / 64;
     const int pixelSize = std::max(1, std::min(2, gRenderPixelSizeY));
+    const float texelsPerPixel = distance * (float)pixelSize * ORIGINAL_VERTICAL_REFERENCE / (float)PROJECTION_H;
     for (int blockY = y0; blockY <= y1;) {
         const int blockEnd = std::min(y1, pixelSize == 2 ? (blockY | 1) : blockY);
         const int y = (blockY + blockEnd) / 2;
@@ -6364,8 +6567,8 @@ static void drawPortalWallSegment(int x, int y0, int y1, float distance, int bru
         for (int py = blockY; py <= blockEnd; ++py) needsPixel = needsPixel || !filled[py];
         if (!needsPixel) { blockY = blockEnd + 1; continue; }
         const int texY = portalWallTextureY(distance, y, anchorWorld, unpegged, (int)texture->height);
-        const unsigned char paletteIndex = sampleTextureBitmap(*texture, texX, texY);
-        const unsigned int color = shadeColor(paletteColor(paletteIndex), blockLightAt(lightBlock, distance, side));
+        const unsigned int color = shadeColor(sampleTextureColor(*texture, texX, texY, texelsPerPixel),
+                                              blockLightAt(lightBlock, distance, side));
         for (int py = blockY; py <= blockEnd; ++py) if (!filled[py]) {
             gFramebuffer[py * FB_W + x] = color;
             gWallDepth[(size_t)py * FB_W + (size_t)x] = distance;
@@ -6383,6 +6586,7 @@ static void sealPortalWallGaps(int x, int y0, int y1, float distance, int brushO
     y1 = std::min(VIEW_H - 1, y1);
     const int texX = brushOffset * (int)texture->width / 64;
     const int pixelSize = std::max(1, std::min(2, gRenderPixelSizeY));
+    const float texelsPerPixel = distance * (float)pixelSize * ORIGINAL_VERTICAL_REFERENCE / (float)PROJECTION_H;
     for (int blockY = y0; blockY <= y1;) {
         const int blockEnd = std::min(y1, pixelSize == 2 ? (blockY | 1) : blockY);
         const int y = (blockY + blockEnd) / 2;
@@ -6390,8 +6594,8 @@ static void sealPortalWallGaps(int x, int y0, int y1, float distance, int brushO
         for (int py = blockY; py <= blockEnd; ++py) needsPixel = needsPixel || !filled[py];
         if (!needsPixel) { blockY = blockEnd + 1; continue; }
         const int texY = portalWallTextureY(distance, y, anchorWorld, false, (int)texture->height);
-        const unsigned char paletteIndex = sampleTextureBitmap(*texture, texX, texY);
-        const unsigned int color = shadeColor(paletteColor(paletteIndex), blockLightAt(lightBlock, distance, side));
+        const unsigned int color = shadeColor(sampleTextureColor(*texture, texX, texY, texelsPerPixel),
+                                              blockLightAt(lightBlock, distance, side));
         for (int py = blockY; py <= blockEnd; ++py) if (!filled[py]) {
             gFramebuffer[(size_t)py * FB_W + (size_t)x] = color;
             gWallDepth[(size_t)py * FB_W + (size_t)x] = distance;
@@ -6591,9 +6795,11 @@ static void drawPlacedObjectBillboards() {
 
 static void playerWeaponPlacementLocked(int& left, int& top) {
     // Walking sway follows the original bob waveform: a gentle sideways swing
-    // per step cycle plus a small dip on every footfall. Looking up lowers the
+    // to one side per footstep plus a small dip on every footfall. Looking up lowers the
     // weapon behind the HUD, looking down raises it.
-    const float angle = gPlayerBobPhase * (6.28318531f / 64.0f);
+    // Half a sway cycle per footstep, with the outermost swing on the footfall
+    // itself (movement.asm plays the step sound at phase 50).
+    const float angle = (gPlayerBobPhase + 64.0f * (float)gPlayerStepParity - 18.0f) * (3.14159265f / 64.0f);
     const float amount = std::max(0.0f, std::min(1.0f, gPlayerBobAmount));
     const int swayX = (int)floorf(sinf(angle) * 3.0f * amount + 0.5f);
     const int swayY = (int)floorf(fabsf(sinf(angle)) * 2.0f * amount + 0.5f);
@@ -6815,33 +7021,21 @@ static void applyWorldRenderPixelSize() {
     }
 }
 
-static void drawRoomRenderer() {
-    updatePlayerMotion();
-    updateAutomapDiscovery();
-    updateRuntimeObjects();
-#ifndef NDEBUG
-    updateOriginalVTableProbe();
-#endif
-    // The former OTable preparation pass rebuilt a complete second set of
-    // rays solely for a disabled diagnostic surface renderer. The visible
-    // portal renderer below already generates the authoritative ray table.
-#ifndef NDEBUG
-    updateHeightRayProbe();
-#endif
-    drawSkyBackground();
-    const int horizon = currentViewHorizonY();
-    for (int y = horizon; y < VIEW_H; ++y)
-        for (int x = 0; x < FB_W; ++x) gFramebuffer[(size_t)y * FB_W + (size_t)x] = 0xff080808u;
-    std::fill(gWallDepth.begin(), gWallDepth.end(), 1.0e30f);
+struct WorldColumnJob {
+    float dirX = 1.0f, dirY = 0.0f, planeX = 0.0f, planeY = 1.0f;
+    int startBlockIndex = 0, pixelSize = 1, horizon = 0;
+    SkyParams sky;
+};
 
-    const float dirX = cosf(gPlayerA), dirY = sinf(gPlayerA);
-    const float planeScale = cameraPlaneScale();
-    const float planeX = -dirY * planeScale, planeY = dirX * planeScale;
-    const int startBlockIndex = currentLgldBlockIndexForCell((int)floorf(gPlayerX), (int)floorf(gPlayerY));
-    const int pixelSize = std::max(1, std::min(2, gRenderPixelSizeX));
+// Renders the 3-D view for columns [xBegin, xEnd). Each column writes only its
+// own framebuffer/depth column (plus x+1 for 2x horizontal pixels; bands are
+// aligned to the pixel size) and reads level data, so bands run in parallel.
+static void renderWorldColumns(int xBegin, int xEnd, const WorldColumnJob& job) {
+    const float dirX = job.dirX, dirY = job.dirY, planeX = job.planeX, planeY = job.planeY;
+    const int startBlockIndex = job.startBlockIndex, pixelSize = job.pixelSize, horizon = job.horizon;
     std::vector<OrigVtHit> hits;
     hits.reserve(32);
-    for (int x = 0; x < FB_W; x += pixelSize) {
+    for (int x = xBegin; x < xEnd; x += pixelSize) {
         bool filled[MAX_FB_H] = {false};
         const float sampleX = (float)x + (float)(pixelSize - 1) * 0.5f;
         const float cameraX = 2.0f * sampleX / (float)FB_W - 1.0f;
@@ -6928,6 +7122,16 @@ static void drawRoomRenderer() {
             drawPortalPlaneSegment(x, std::max(clipTop, horizon), clipBottom, rayX, rayY,
                                    nearDistance, 64.0f, *last, true, filled);
         }
+        // Sky only where nothing covered this column above the horizon.
+        for (int blockY = 0; blockY < horizon; blockY += job.sky.pixelSizeY) {
+            const int blockEnd = std::min(horizon, blockY + job.sky.pixelSizeY);
+            bool open = false;
+            for (int py = blockY; py < blockEnd; ++py) open = open || !filled[py];
+            if (!open) continue;
+            const unsigned int color = skyColorAt(job.sky, x, blockY);
+            for (int py = blockY; py < blockEnd; ++py)
+                if (!filled[py]) gFramebuffer[(size_t)py * FB_W + (size_t)x] = color;
+        }
         // The expensive portal/V-table traversal runs once for a 2-column
         // block whenever horizontal 2x sampling is active. Copy its completed
         // depth-tested column before billboards and effects are composited.
@@ -6939,7 +7143,107 @@ static void drawRoomRenderer() {
                     gWallDepth[(size_t)y * FB_W + (size_t)x];
             }
         }
+        }
+}
+
+// Persistent worker threads for the column renderer: the OUYA's Tegra 3 has four
+// cores, and the software renderer previously used only one of them.
+class WorldRenderWorkers {
+public:
+    void run(const WorldColumnJob& job, int width, int step) {
+        start();
+        if (workers_ == 0) { renderWorldColumns(0, width, job); return; }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            job_ = job;
+            width_ = width;
+            step_ = std::max(1, step);
+            pending_ = workers_;
+            ++generation_;
+        }
+        wake_.notify_all();
+        renderBand(0);
+        std::unique_lock<std::mutex> lock(mutex_);
+        done_.wait(lock, [this] { return pending_ == 0; });
     }
+
+private:
+    void start() {
+        if (started_) return;
+        started_ = true;
+        const long cpus = sysconf(_SC_NPROCESSORS_CONF);
+        workers_ = (int)std::max(0L, std::min(3L, cpus - 1L));
+        for (int i = 0; i < workers_; ++i) std::thread(&WorldRenderWorkers::loop, this, i + 1).detach();
+        LOGI("world renderer threads=%d", workers_ + 1);
+    }
+
+    void renderBand(int band) {
+        const int bands = workers_ + 1;
+        const int columns = (width_ + step_ - 1) / step_;
+        const int c0 = columns * band / bands;
+        const int c1 = columns * (band + 1) / bands;
+        if (c1 > c0) renderWorldColumns(c0 * step_, std::min(width_, c1 * step_), job_);
+    }
+
+    void loop(int band) {
+        unsigned int seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                wake_.wait(lock, [&] { return generation_ != seen; });
+                seen = generation_;
+            }
+            renderBand(band);
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (--pending_ == 0) done_.notify_one();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable wake_, done_;
+    WorldColumnJob job_;
+    int width_ = 0, step_ = 1, workers_ = 0, pending_ = 0;
+    unsigned int generation_ = 0;
+    bool started_ = false;
+};
+
+static WorldRenderWorkers& worldRenderWorkers() {
+    // Intentionally never destroyed: detached workers wait on it for the
+    // lifetime of the process.
+    static WorldRenderWorkers* workers = new WorldRenderWorkers();
+    return *workers;
+}
+
+static void drawRoomRenderer() {
+    updatePlayerMotion();
+    updateAutomapDiscovery();
+    updateRuntimeObjects();
+#ifndef NDEBUG
+    updateOriginalVTableProbe();
+#endif
+    // The former OTable preparation pass rebuilt a complete second set of
+    // rays solely for a disabled diagnostic surface renderer. The visible
+    // portal renderer below already generates the authoritative ray table.
+#ifndef NDEBUG
+    updateHeightRayProbe();
+#endif
+    const int horizon = currentViewHorizonY();
+    for (int y = horizon; y < VIEW_H; ++y)
+        for (int x = 0; x < FB_W; ++x) gFramebuffer[(size_t)y * FB_W + (size_t)x] = 0xff080808u;
+    std::fill(gWallDepth.begin(), gWallDepth.end(), 1.0e30f);
+
+    const float dirX = cosf(gPlayerA), dirY = sinf(gPlayerA);
+    const float planeScale = cameraPlaneScale();
+    const float planeX = -dirY * planeScale, planeY = dirX * planeScale;
+    const int startBlockIndex = currentLgldBlockIndexForCell((int)floorf(gPlayerX), (int)floorf(gPlayerY));
+    const int pixelSize = std::max(1, std::min(2, gRenderPixelSizeX));
+    gTextureAnimSeconds = nowSeconds();
+    ensureLevelTextureCache(); // workers below only read the cache
+    WorldColumnJob job;
+    job.dirX = dirX; job.dirY = dirY; job.planeX = planeX; job.planeY = planeY;
+    job.startBlockIndex = startBlockIndex; job.pixelSize = pixelSize; job.horizon = horizon;
+    job.sky = currentSkyParams();
+    worldRenderWorkers().run(job, FB_W, pixelSize);
     sealOnePixelDepthPinholes();
     drawPlacedObjectBillboards();
     drawRuntimeProjectiles();
@@ -7692,6 +7996,13 @@ static void toggleBlobShadows() {
     gPauseBackgroundRefreshRequested.store(true);
 }
 
+static void toggleMipmapping() {
+    gMipmapEnabled = !gMipmapEnabled;
+    playSoundResource("SWT1");
+    saveControlBindings();
+    gPauseBackgroundRefreshRequested.store(true);
+}
+
 static void toggleSmoothing() {
     gSmoothingEnabled = !gSmoothingEnabled;
     playSoundResource("SWT1");
@@ -7743,10 +8054,11 @@ static void adjustPauseOption() {
     switch (gPauseOptionsSelection) {
         case 1: toggleRenderPixelSize(); break;
         case 2: toggleBlobShadows(); break;
-        case 3: toggleSmoothing(); break;
-        case 4: toggleDepthOfField(); break;
-        case 5: toggleGlow(); break;
-        case 6: toggleLensFlare(); break;
+        case 3: toggleMipmapping(); break;
+        case 4: toggleSmoothing(); break;
+        case 5: toggleDepthOfField(); break;
+        case 6: toggleGlow(); break;
+        case 7: toggleLensFlare(); break;
         default: break;
     }
 }
@@ -7816,7 +8128,7 @@ static void drawPauseMenu() {
     if (gPauseBackgroundRefreshRequested.exchange(false)) refreshPausedGameFrame();
     if (gPauseBackground.size() == gFramebuffer.size()) gFramebuffer = gPauseBackground;
     beginMenuOverlay();
-    char pixelSize[32], blobShadows[32], smoothing[32], depthOfField[32], glow[32], lensFlare[32];
+    char pixelSize[32], blobShadows[32], mipmapping[32], smoothing[32], depthOfField[32], glow[32], lensFlare[32];
     const char* title = "GAME MENU";
     const char* entries[PAUSE_OPTION_ENTRIES] = {"RESUME", "OPTIONS", "RESTART LEVEL", "QUIT TO TITLE", "", "", ""};
     if (gPauseOptionsOpen) {
@@ -7825,15 +8137,17 @@ static void drawPauseMenu() {
         snprintf(blobShadows, sizeof(blobShadows), "BLOBSHADOWS  %s", gBlobShadowsEnabled ? "ON" : "OFF");
         snprintf(smoothing, sizeof(smoothing), "SMOOTHING  %s", gSmoothingEnabled ? "ON" : "OFF");
         snprintf(depthOfField, sizeof(depthOfField), "DEPTH OF FIELD  %s", gDepthOfFieldEnabled ? "ON" : "OFF");
+        snprintf(mipmapping, sizeof(mipmapping), "MIPMAPPING  %s", gMipmapEnabled ? "ON" : "OFF");
         entries[0] = "BACK";
         entries[1] = pixelSize;
         entries[2] = blobShadows;
-        entries[3] = smoothing;
-        entries[4] = depthOfField;
+        entries[3] = mipmapping;
+        entries[4] = smoothing;
+        entries[5] = depthOfField;
         snprintf(glow, sizeof(glow), "GLOW  %s", gGlowEnabled ? "ON" : "OFF");
         snprintf(lensFlare, sizeof(lensFlare), "LENS FLARE  %s", gLensFlareEnabled ? "ON" : "OFF");
-        entries[5] = glow;
-        entries[6] = lensFlare;
+        entries[6] = glow;
+        entries[7] = lensFlare;
     }
     drawOverlayTextCentered(PAUSE_TITLE_Y, title);
     const int count = pauseMenuEntryCount();
@@ -8100,7 +8414,11 @@ static void drawFrame() {
     } else if (gFrontendState != FRONTEND_GAME) {
         updateAndDrawFrontend();
     } else if (currentLgldAsset()) {
+        const double perfStart = nowSeconds();
         drawRoomRenderer();
+        const double perfWorld = nowSeconds();
+        gPerfWorld += perfWorld - perfStart;
+        ++gPerfFrames;
         applyTeleportWhiteFade();
         captureWorldLayer();
         drawPlayerWeapon();
@@ -8113,6 +8431,7 @@ static void drawFrame() {
             gLastGameFramebuffer = gFramebuffer;
             gHaveGameSnapshot = true;
         }
+        gPerfCompose += nowSeconds() - perfWorld;
     } else {
         // The asset browser was useful during early reverse-engineering builds,
         // but it must never leak into the released game. A missing or damaged
@@ -8278,10 +8597,9 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
     gTexLoc = -1;
     gScaleLoc = -1;
     gUvScaleLoc = -1;
-    gWorldTexLoc = gWorldTexelLoc = gWorldScaleYLoc = gSmoothLoc = gDofLoc = -1;
-    gBloomTexLoc = gGlowLoc = gFlareLoc = -1;
-    gFlareLight0Loc = gFlareLight1Loc = gFlareAspectLoc = -1;
-    gFlareTint0Loc = gFlareTint1Loc = -1;
+    for (int i = 0; i < 16; ++i) gScreenPrograms[i] = ScreenProgram();
+    gFlareProgram = 0;
+    gFlareProgramTried = false;
     gBloomTexture = 0;
     gBloomTextureWidth = gBloomTextureHeight = 0;
     gWorldTexture = 0;
@@ -8346,10 +8664,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRenderer_nativeRender(JNIEnv*, jclass) {
     ensureGl();
     drawFrame();
+    struct GpuTimer {
+        double start = nowSeconds();
+        ~GpuTimer() { gPerfGpu += nowSeconds() - start; }
+    } gpuTimer;
     glViewport(0, 0, gViewW, gViewH);
     glClearColor(0.f, 0.f, 0.f, 1.f);
     glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(gProgram);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, gTexture);
     const bool presentation = gFrontendState != FRONTEND_GAME && gFrontendState != FRONTEND_MAP && gFrontendState != FRONTEND_PAUSE &&
@@ -8364,14 +8685,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
     } else {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, textureWidth, textureHeight, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
     }
-    glUniform1i(gTexLoc, 0);
     const size_t worldPixels = (size_t)FB_W * (size_t)VIEW_H;
     const bool postFx = !presentation && gFrontendState != FRONTEND_MAP &&
                         (gSmoothingEnabled || gDepthOfFieldEnabled || gGlowEnabled || gLensFlareEnabled) &&
                         gWorldFramebuffer.size() == worldPixels;
     const bool bloomFx = postFx && (gGlowEnabled || gLensFlareEnabled) && gBloomWidth > 0 &&
                          gBloomFramebuffer.size() == (size_t)gBloomWidth * (size_t)gBloomHeight;
-    if (bloomFx) {
+    if (bloomFx && gGlowEnabled) {
         glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, gBloomTexture);
         if (gBloomTextureWidth != gBloomWidth || gBloomTextureHeight != gBloomHeight) {
@@ -8397,19 +8717,19 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
         gWorldFramebufferDirty = false;
         glActiveTexture(GL_TEXTURE0);
     }
-    glUniform1i(gWorldTexLoc, 1);
-    glUniform2f(gWorldTexelLoc, 1.0f / (float)FB_W, 1.0f / (float)std::max(1, VIEW_H));
-    glUniform1f(gWorldScaleYLoc, (float)FB_H / (float)std::max(1, VIEW_H));
-    glUniform1f(gSmoothLoc, postFx && gSmoothingEnabled ? 1.0f : 0.0f);
-    glUniform1f(gDofLoc, postFx && gDepthOfFieldEnabled ? 1.0f : 0.0f);
-    glUniform1i(gBloomTexLoc, 2);
-    glUniform1f(gGlowLoc, bloomFx && gGlowEnabled ? 1.0f : 0.0f);
-    glUniform1f(gFlareLoc, bloomFx && gLensFlareEnabled ? 1.0f : 0.0f);
-    glUniform4f(gFlareLight0Loc, gFlareLights[0].x, gFlareLights[0].y, gFlareLights[0].intensity * gFlareFade, 0.0f);
-    glUniform4f(gFlareLight1Loc, gFlareLights[1].x, gFlareLights[1].y, gFlareLights[1].intensity * gFlareFade, 0.0f);
-    glUniform1f(gFlareAspectLoc, (float)FB_W / (float)std::max(1, VIEW_H));
-    glUniform3f(gFlareTint0Loc, gFlareLights[0].r, gFlareLights[0].g, gFlareLights[0].b);
-    glUniform3f(gFlareTint1Loc, gFlareLights[1].r, gFlareLights[1].g, gFlareLights[1].b);
+    unsigned int fx = 0u;
+    if (postFx && gSmoothingEnabled) fx |= FX_SMOOTH;
+    if (postFx && gDepthOfFieldEnabled) fx |= FX_DOF;
+    if (bloomFx && gGlowEnabled) fx |= FX_GLOW;
+    const ScreenProgram& sp = screenProgram(fx);
+    glUseProgram(sp.program);
+    glUniform1i(sp.tex, 0);
+    if (fx != 0u) {
+        glUniform1i(sp.world, 1);
+        glUniform2f(sp.worldTexel, 1.0f / (float)FB_W, 1.0f / (float)std::max(1, VIEW_H));
+        glUniform1f(sp.worldScaleY, (float)FB_H / (float)std::max(1, VIEW_H));
+        glUniform1i(sp.bloom, 2);
+    }
     float scaleX = 1.0f, scaleY = 1.0f;
     const float contentAspect = (float)textureWidth / (float)textureHeight;
     const float screenAspect = gViewH > 0 ? (float)gViewW / (float)gViewH : contentAspect;
@@ -8417,21 +8737,22 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
     else scaleY = screenAspect / contentAspect;
     if (gFrontendState == FRONTEND_CREDITS) {
         // Credits deliberately keep plain black side bars.
-        glUniform2f(gScaleLoc, scaleX, scaleY);
-        glUniform2f(gUvScaleLoc, 1.0f, 1.0f);
+        glUniform2f(sp.scale, scaleX, scaleY);
+        glUniform2f(sp.uvScale, 1.0f, 1.0f);
     } else {
         // Presentation graphics keep their original aspect and repeat the
         // outermost pixel row/column.  During gameplay the logical framebuffer
         // already follows the physical display aspect, so this scale normally
         // resolves to 1:1 without repeated side columns.
-        glUniform2f(gScaleLoc, 1.0f, 1.0f);
-        glUniform2f(gUvScaleLoc, scaleX, scaleY);
+        glUniform2f(sp.scale, 1.0f, 1.0f);
+        glUniform2f(sp.uvScale, scaleX, scaleY);
     }
     glBindBuffer(GL_ARRAY_BUFFER, gVbo);
-    glEnableVertexAttribArray(gPosLoc); glEnableVertexAttribArray(gUvLoc);
-    glVertexAttribPointer(gPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)0);
-    glVertexAttribPointer(gUvLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)(2 * sizeof(GLfloat)));
+    glEnableVertexAttribArray(sp.pos); glEnableVertexAttribArray(sp.uv);
+    glVertexAttribPointer(sp.pos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)0);
+    glVertexAttribPointer(sp.uv, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)(2 * sizeof(GLfloat)));
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    if (bloomFx && gLensFlareEnabled) drawLensFlareGhosts();
 
     if (!presentation && gFrontendState != FRONTEND_MAP && gMenuOverlayVisible && gOverlayProgram &&
         gMenuOverlay.size() == (size_t)gMenuOverlayW * (size_t)MENU_OVERLAY_H) {
