@@ -1,6 +1,8 @@
 package com.ast.breathlessamiga;
 
 import android.app.Activity;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
@@ -92,6 +94,8 @@ public class MainActivity extends Activity {
     private static native String nativeMusicCode();
     private static native int nativeMusicVolume();
     private static native boolean nativeConsumeQuitRequest();
+    private static native void nativeSetWeaponSprites(int[] body, int bodyWidth, int bodyHeight,
+                                                      int[] orb, int orbWidth, int orbHeight);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -105,6 +109,7 @@ public class MainActivity extends Activity {
         migrateLegacyState(dataDir);
         nativeSetOuyaDevice(PlatformUi.isOuyaDevice());
         nativeSetDataPath(dataDir.getAbsolutePath());
+        loadWeaponSprites();
         chromeOsDevice = isChromeOsDevice();
         desktopInputActive = chromeOsDevice || hasHardwareKeyboard();
 
@@ -733,6 +738,49 @@ public class MainActivity extends Activity {
         } finally {
             zip.close();
             in.close();
+        }
+    }
+
+    /**
+     * Loads the first-person weapon layers. Both PNGs share one canvas so the
+     * orb stays registered on the barrel; the native renderer draws them 1:1
+     * in game pixels without filtering.
+     */
+    private void loadWeaponSprites() {
+        Bitmap body = decodeAssetBitmap("weapon/induction_cannon_body.png");
+        if (body == null) return;
+        Bitmap orb = decodeAssetBitmap("weapon/energy_orb.png");
+        int bodyWidth = body.getWidth(), bodyHeight = body.getHeight();
+        int[] bodyPixels = new int[bodyWidth * bodyHeight];
+        body.getPixels(bodyPixels, 0, bodyWidth, 0, 0, bodyWidth, bodyHeight);
+        body.recycle();
+        int[] orbPixels = null;
+        int orbWidth = 0, orbHeight = 0;
+        if (orb != null) {
+            orbWidth = orb.getWidth();
+            orbHeight = orb.getHeight();
+            orbPixels = new int[orbWidth * orbHeight];
+            orb.getPixels(orbPixels, 0, orbWidth, 0, 0, orbWidth, orbHeight);
+            orb.recycle();
+        }
+        nativeSetWeaponSprites(bodyPixels, bodyWidth, bodyHeight, orbPixels, orbWidth, orbHeight);
+    }
+
+    private Bitmap decodeAssetBitmap(String name) {
+        InputStream in = null;
+        try {
+            in = getAssets().open(name);
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inScaled = false;
+            options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            return BitmapFactory.decodeStream(in, null, options);
+        } catch (IOException e) {
+            Log.w("Breathless", "missing asset " + name);
+            return null;
+        } finally {
+            if (in != null) {
+                try { in.close(); } catch (IOException ignored) { }
+            }
         }
     }
 }

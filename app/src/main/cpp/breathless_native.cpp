@@ -30,6 +30,17 @@ static std::string gDataPath;
 static GLuint gProgram = 0, gTexture = 0, gVbo = 0;
 static int gTextureWidth = 0, gTextureHeight = 0;
 static GLint gPosLoc = -1, gUvLoc = -1, gTexLoc = -1, gScaleLoc = -1, gUvScaleLoc = -1;
+static GLint gWorldTexLoc = -1, gWorldTexelLoc = -1, gWorldScaleYLoc = -1, gSmoothLoc = -1, gDofLoc = -1;
+static GLint gBloomTexLoc = -1, gGlowLoc = -1, gFlareLoc = -1;
+static GLint gFlareLight0Loc = -1, gFlareLight1Loc = -1, gFlareAspectLoc = -1;
+static GLint gFlareTint0Loc = -1, gFlareTint1Loc = -1;
+static GLuint gBloomTexture = 0;
+static int gBloomTextureWidth = 0, gBloomTextureHeight = 0;
+static GLuint gWorldTexture = 0;
+static int gWorldTextureWidth = 0, gWorldTextureHeight = 0;
+static GLuint gOverlayProgram = 0, gOverlayTexture = 0;
+static GLint gOverlayPosLoc = -1, gOverlayUvLoc = -1, gOverlayTexLoc = -1, gOverlayScaleLoc = -1;
+static int gOverlayTextureWidth = 0, gOverlayTextureHeight = 0;
 static int gViewW = 1, gViewH = 1;
 static unsigned gFrame = 0;
 static int gGldFiles = -1;
@@ -71,9 +82,20 @@ static double gFpsLastTime = 0.0;
 static const int BASE_FB_W = 356;
 static const int MAX_FB_W = 800;
 static int FB_W = BASE_FB_W;
-static const int FB_H = 200;
-static const int VIEW_H = 160;
-static const int VIEW_CENTER_Y = VIEW_H / 2;
+// The logical framebuffer follows the physical display aspect in both
+// directions: wider displays extend FB_W, taller ones (16:10, 4:3) extend
+// FB_H. The original 40-line HUD always occupies the bottom rows, and the
+// 3-D view uses everything above it.
+static const int BASE_FB_H = 200;
+static const int MAX_FB_H = 400;
+static const int HUD_H = 40;
+static int FB_H = BASE_FB_H;
+static int VIEW_H = BASE_FB_H - HUD_H;
+static int VIEW_CENTER_Y = VIEW_H / 2;
+static const int BASE_VIEW_CENTER_Y = (BASE_FB_H - HUD_H) / 2;
+// Vertical world projection keeps the original 200-line reference so a taller
+// framebuffer reveals more scenery instead of zooming the camera.
+static const int PROJECTION_H = BASE_FB_H;
 static const int ORIGINAL_W = 320;
 static const int PRESENTATION_H = 240;
 static int HUD_X = (FB_W - ORIGINAL_W) / 2;
@@ -86,6 +108,67 @@ static std::vector<unsigned int> gLastGameFramebuffer(FB_W * FB_H);
 static std::mutex gGameSnapshotMutex;
 static bool gHaveGameSnapshot = false;
 static std::vector<unsigned int> gPresentationFramebuffer(ORIGINAL_W * PRESENTATION_H);
+// World-only copy of the 3-D view (FB_W x VIEW_H). The GPU smoothing and
+// depth-of-field filters sample it so HUD, weapon and text never bleed into
+// the filtered scenery. In gFramebuffer, world pixels carry an encoded depth
+// in their alpha byte (0..240); every overlay pixel keeps alpha 0xff.
+static std::vector<unsigned int> gWorldFramebuffer;
+static bool gWorldFramebufferDirty = false;
+static const float WORLD_DEPTH_RANGE = 16.0f;
+// Quarter-resolution bright-pass of the world layer, blurred on the CPU. It
+// feeds the optional glow (bloom) and the screen-space lens flare.
+static const int BLOOM_DOWNSAMPLE = 4;
+static std::vector<unsigned int> gBloomFramebuffer;
+static int gBloomWidth = 0, gBloomHeight = 0;
+static bool gBloomFramebufferDirty = false;
+// Up to two light sources for the lens flare, in 3-D view UV space, with a
+// temporally smoothed intensity so ghosts fade instead of popping.
+struct FlareLight { float x = 0.5f, y = 0.5f, intensity = 0.0f, r = 1.0f, g = 1.0f, b = 1.0f; };
+static const int FLARE_LIGHTS = 2;
+static FlareLight gFlareLights[FLARE_LIGHTS];
+static float gFlareFade = 1.0f;
+// The in-game menu is a transparent overlay with the 240-line presentation
+// scale, so its text matches the title menus exactly.
+static const int MENU_OVERLAY_H = PRESENTATION_H;
+static int gMenuOverlayW = 427;
+static std::vector<unsigned int> gMenuOverlay;
+static bool gMenuOverlayVisible = false;
+static const int PAUSE_TITLE_Y = 46;
+static const int PAUSE_FIRST_ENTRY_Y = 66;
+static const int PAUSE_ENTRY_SPACING = 14;
+// Extra gap above QUIT TO TITLE, matching the title-to-first-entry gap.
+static const int PAUSE_GROUP_GAP = (PAUSE_FIRST_ENTRY_Y - PAUSE_TITLE_Y) - PAUSE_ENTRY_SPACING;
+static const int PAUSE_MAIN_ENTRIES = 4;
+static const int PAUSE_OPTION_ENTRIES = 7;
+
+struct WeaponSprite {
+    int width = 0;
+    int height = 0;
+    int contentBottom = 0;
+    float anchorX = 0.0f; // alpha-weighted centre (the orb marks the muzzle)
+    float anchorY = 0.0f;
+    std::vector<unsigned int> pixels; // framebuffer byte order, straight alpha
+    bool ok = false;
+};
+static WeaponSprite gWeaponBody;
+static WeaponSprite gWeaponOrb;
+static const int WEAPON_ORB_TINTS = 6;
+static WeaponSprite gWeaponOrbTinted[WEAPON_ORB_TINTS];
+static std::mutex gWeaponSpriteMutex;
+// Resting position sits a few pixels lower (partly behind the HUD); looking
+// up/down moves the weapon by this fraction of the horizon shift.
+static const int WEAPON_BASE_DROP = 5;
+// Looking down may raise the weapon by at most 3 px, so its base always stays
+// 2 px behind the HUD; looking up lowers it by at most 7 px. Both scale
+// smoothly over the full look range (about +-65 px of horizon shift).
+static const float WEAPON_LOOK_RAISE_MAX = 3.0f;
+static const float WEAPON_LOOK_LOWER_MAX = 7.0f;
+static const float WEAPON_LOOK_RANGE_PX = 65.0f;
+// Every player shot flies with its visual centre at this height above the
+// player's floor (eye height is 54), and is drawn emerging from the muzzle
+// during its first cells of flight.
+static const float PLAYER_SHOT_CENTER_HEIGHT = 42.0f;
+static const float PLAYER_SHOT_LAUNCH_DISTANCE = 1.5f;
 
 struct TextureEntry {
     std::string name;
@@ -388,12 +471,18 @@ static int gSoundMenuSelection = 0;
 static int gControlsMenuSelection = 0;
 static int gControlCapture = -1;
 static int gPauseMenuSelection = 0;
+static bool gPauseOptionsOpen = false;
+static int gPauseOptionsSelection = 0;
 static std::atomic<bool> gPauseBackgroundRefreshRequested(false);
 // Horizontal and vertical world sampling are selectable independently.
 // UI/HUD always remain pixel-exact.
 static int gRenderPixelSizeX = 1;
 static int gRenderPixelSizeY = 1;
 static bool gBlobShadowsEnabled = true;
+static bool gSmoothingEnabled = false;
+static bool gDepthOfFieldEnabled = false;
+static bool gGlowEnabled = false;
+static bool gLensFlareEnabled = false;
 // Set by the Java launcher before game data/settings are loaded. This checks
 // the physical device identity, not the OUYA product flavor (which is also
 // used by modern handhelds such as Retroid).
@@ -538,6 +627,7 @@ static float gPlayerLookSpeed = 0.0f;
 static int gPlayerLookHorizonY = VIEW_CENTER_Y;
 static float gPlayerBobPhase = 0.0f;
 static float gPlayerBobOffset = 0.0f;
+static float gPlayerBobAmount = 0.0f; // display-only: weapon sway strength
 static bool gPlayerFalling = false;
 static int gPlayerFallStartZ = 0;
 static int gPlayerHealth = 100;
@@ -1028,7 +1118,7 @@ static void drawOriginalHudNumber(int x, int panelY, int value, int digits, bool
                     else paletteIndex &= (unsigned char)~planes[p];
                 }
             }
-            gFramebuffer[(size_t)(160 + panelY + row) * FB_W + (size_t)(HUD_X + px)] = paletteColor(paletteIndex);
+            gFramebuffer[(size_t)(VIEW_H + panelY + row) * FB_W + (size_t)(HUD_X + px)] = paletteColor(paletteIndex);
         }
     }
 }
@@ -2383,7 +2473,7 @@ static bool saveControlBindings() {
     std::vector<unsigned char> bytes;
     static const unsigned char magic[8] = {'B','L','C','T','R','L','0','1'};
     bytes.insert(bytes.end(), magic, magic + sizeof(magic));
-    appendSaveU32(bytes, 7u);
+    appendSaveU32(bytes, 9u);
     appendSaveU32(bytes, (unsigned int)gFireKey);
     appendSaveU32(bytes, (unsigned int)gActivateKey);
     appendSaveU32(bytes, (unsigned int)gWeaponKey);
@@ -2397,6 +2487,10 @@ static bool saveControlBindings() {
     appendSaveU32(bytes, (unsigned int)gMusicVolume);
     appendSaveU32(bytes, gSoundEnabled.load() ? 1u : 0u);
     appendSaveU32(bytes, gMusicEnabled ? 1u : 0u);
+    appendSaveU32(bytes, gSmoothingEnabled ? 1u : 0u);
+    appendSaveU32(bytes, gDepthOfFieldEnabled ? 1u : 0u);
+    appendSaveU32(bytes, gGlowEnabled ? 1u : 0u);
+    appendSaveU32(bytes, gLensFlareEnabled ? 1u : 0u);
     appendSaveU32(bytes, fnv1aUpdate(2166136261u, &bytes[0], bytes.size()));
 
     const std::string temporaryPath = path + ".tmp";
@@ -2414,7 +2508,7 @@ static bool saveControlBindings() {
          gRenderPixelSizeX, gRenderPixelSizeY, gBlobShadowsEnabled ? "yes" : "no",
          gSoundVolume, gSoundEnabled.load() ? "on" : "off",
          gMusicVolume, gMusicEnabled ? "on" : "off");
-    gLoadedControlVersion = 7u;
+    gLoadedControlVersion = 9u;
     return true;
 }
 
@@ -2426,7 +2520,7 @@ static bool loadControlBindings() {
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
     const long length = ftell(file);
     if ((length != 36 && length != 40 && length != 44 && length != 48 &&
-         length != 52 && length != 68) ||
+         length != 52 && length != 68 && length != 76 && length != 84) ||
         fseek(file, 0, SEEK_SET) != 0) { fclose(file); return false; }
     std::vector<unsigned char> bytes((size_t)length);
     const bool read = fread(&bytes[0], 1, bytes.size(), file) == bytes.size();
@@ -2441,12 +2535,14 @@ static bool loadControlBindings() {
     const unsigned int version = readSaveU32(bytes, offset, ok);
     if (!ok || (version != 1u && version != 2u && version != 3u &&
                 version != 4u && version != 5u && version != 6u &&
-                version != 7u)) return false;
+                version != 7u && version != 8u && version != 9u)) return false;
     if ((version == 1u && length != 36) || (version == 2u && length != 40) ||
         (version == 3u && length != 44) ||
         ((version == 4u || version == 5u) && length != 48) ||
         (version == 6u && length != 52) ||
-        (version == 7u && length != 68)) return false;
+        (version == 7u && length != 68) ||
+        (version == 8u && length != 76) ||
+        (version == 9u && length != 84)) return false;
     const int bindings[5] = {
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
@@ -2497,6 +2593,24 @@ static bool loadControlBindings() {
         gMusicVolume = (int)musicVolume;
         gSoundEnabled.store(soundEnabled != 0u);
         gMusicEnabled = musicEnabled != 0u;
+    }
+    gSmoothingEnabled = false;
+    gDepthOfFieldEnabled = false;
+    if (version >= 8u) {
+        const unsigned int smoothing = readSaveU32(bytes, offset, ok);
+        const unsigned int depthOfField = readSaveU32(bytes, offset, ok);
+        if (!ok || smoothing > 1u || depthOfField > 1u) return false;
+        gSmoothingEnabled = smoothing != 0u;
+        gDepthOfFieldEnabled = depthOfField != 0u;
+    }
+    gGlowEnabled = false;
+    gLensFlareEnabled = false;
+    if (version >= 9u) {
+        const unsigned int glow = readSaveU32(bytes, offset, ok);
+        const unsigned int lensFlare = readSaveU32(bytes, offset, ok);
+        if (!ok || glow > 1u || lensFlare > 1u) return false;
+        gGlowEnabled = glow != 0u;
+        gLensFlareEnabled = lensFlare != 0u;
     }
     LOGI("controller/video/audio settings loaded fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d blobShadows=%s sound=%d/%s music=%d/%s version=%u",
          gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey, gMapKey,
@@ -3113,17 +3227,99 @@ static void scanGameData() {
             LOGE("OUYA hardware detected: could not persist initial 2x2 render size");
         }
     }
-    LOGI("Breathless Android 1.1 dataPath=%s gldFiles=%d first=%s probe=%s save=%s controls=%s ouya=%s", gDataPath.c_str(), gGldFiles, gFirstGldName.c_str(), gFirstGldProbeOk ? "OK" : "MISS", gPlayerProgressValid ? "loaded" : "new", controlsLoaded ? "loaded" : "defaults", gOuyaDevice ? "yes" : "no");
+    LOGI("Breathless Android 2.0 dataPath=%s gldFiles=%d first=%s probe=%s save=%s controls=%s ouya=%s", gDataPath.c_str(), gGldFiles, gFirstGldName.c_str(), gFirstGldProbeOk ? "OK" : "MISS", gPlayerProgressValid ? "loaded" : "new", controlsLoaded ? "loaded" : "defaults", gOuyaDevice ? "yes" : "no");
+}
+
+static GLuint linkProgram(const char* vs, const char* fs) {
+    GLuint v = compileShader(GL_VERTEX_SHADER, vs);
+    GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
+    GLuint program = glCreateProgram();
+    glAttachShader(program, v); glAttachShader(program, f); glLinkProgram(program);
+    glDeleteShader(v); glDeleteShader(f);
+    GLint linked = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) LOGE("shader program link failed");
+    return program;
 }
 
 static void ensureGl() {
     if (gProgram) return;
     const char* vs = "attribute vec2 aPos; attribute vec2 aUv; uniform vec2 uScale; varying vec2 vUv; void main(){ vUv=aUv; gl_Position=vec4(aPos*uScale,0.0,1.0); }";
-    const char* fs = "precision mediump float; varying vec2 vUv; uniform sampler2D uTex; uniform vec2 uUvScale; void main(){ vec2 uv=clamp((vUv-vec2(0.5))/uUvScale+vec2(0.5),vec2(0.0),vec2(1.0)); gl_FragColor=texture2D(uTex,uv); }";
-    GLuint v = compileShader(GL_VERTEX_SHADER, vs);
-    GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
-    gProgram = glCreateProgram(); glAttachShader(gProgram, v); glAttachShader(gProgram, f); glLinkProgram(gProgram); glDeleteShader(v); glDeleteShader(f);
+    // World pixels (alpha < 0xff) may be replaced by the bilinear world-only
+    // texture (smoothing) and blurred by their encoded depth (depth of field).
+    // HUD, weapon and text keep alpha 0xff and are always shown pixel-exact.
+    const char* fs =
+        "precision mediump float; varying vec2 vUv; uniform sampler2D uTex; uniform sampler2D uWorld;"
+        "uniform sampler2D uBloom; uniform float uGlow; uniform float uFlare;"
+        "uniform vec2 uUvScale; uniform vec2 uWorldTexel; uniform float uWorldScaleY; uniform float uSmooth; uniform float uDof;"
+        // Lens flare ghosts as in CubeEvil4 (gx_fixed_shaders.h kFlareVs/kFlareFs): five ghosts at
+        // centre + (light - centre) * g.x, radius g.y of the view height (growing a little with the
+        // light's distance from the centre), strength g.z; soft discs, aperture hexagons and one ring,
+        // coloured 75 % by the ghost and 25 % by the light. Added faintly, at most about a tenth.
+        "uniform vec4 uLight0; uniform vec4 uLight1; uniform vec3 uTint0; uniform vec3 uTint1; uniform float uAspect;"
+        "float ghostShape(vec2 p, vec2 c, float r, float kind){"
+        " vec2 u=p-c; u.x*=uAspect; u/=r; float d=length(u);"
+        " if(d>=1.0) return 0.0;"
+        " if(kind>2.5 && kind<3.5 || kind>4.5){"
+        "  vec2 h=abs(u); float hex=max(h.x*0.866+h.y*0.5,h.y);"
+        "  return (1.0-smoothstep(0.84,0.98,hex))*0.55+smoothstep(0.74,0.88,hex)*(1.0-smoothstep(0.88,0.98,hex))*0.8;"
+        " }"
+        " if(kind>3.5) return (1.0-smoothstep(0.86,1.0,d))*smoothstep(0.62,0.84,d)+(1.0-d)*0.25;"
+        " return 1.0-smoothstep(0.2,1.0,d);"
+        "}"
+        "vec3 lensFlare(vec2 p, vec4 L, vec3 tint){"
+        " if(L.z<=0.003) return vec3(0.0);"
+        " vec2 m=vec2(0.5); vec2 off=L.xy-m;"
+        " vec2 oa=off; oa.x*=uAspect;"
+        " float grow=0.8+0.4*length(oa);"
+        " vec3 f=ghostShape(p,m+off*0.42,0.030*grow,1.0)*mix(vec3(0.35,1.0,0.55),tint,0.25)*0.18"
+        "       +ghostShape(p,m+off*0.18,0.016*grow,2.0)*mix(vec3(1.0,0.72,0.35),tint,0.25)*0.22"
+        "       +ghostShape(p,m-off*0.30,0.055*grow,3.0)*mix(vec3(0.72,0.42,1.0),tint,0.25)*0.13"
+        "       +ghostShape(p,m-off*0.62,0.024*grow,4.0)*mix(vec3(0.35,0.62,1.0),tint,0.25)*0.20"
+        "       +ghostShape(p,m-off*1.05,0.080*grow,5.0)*mix(vec3(0.40,0.95,0.85),tint,0.25)*0.09;"
+        " return f*L.z*0.8;"
+        "}"
+        "void main(){"
+        " vec2 uv=clamp((vUv-vec2(0.5))/uUvScale+vec2(0.5),vec2(0.0),vec2(1.0));"
+        " vec4 c=texture2D(uTex,uv); vec3 col=c.rgb;"
+        " float wy=uv.y*uWorldScaleY;"
+        " if(wy<1.0 && (uSmooth>0.5 || uDof>0.5 || uGlow>0.5 || uFlare>0.5)){"
+        "  vec2 wuv=vec2(uv.x,wy);"
+        "  if(c.a<0.97){"
+        "   if(uSmooth>0.5) col=texture2D(uWorld,wuv).rgb;"
+        // The blur amount comes from the bilinearly filtered depth (world texture alpha)
+        // and the base colour turns bilinear as soon as blurring starts: the nearest
+        // texel's colour and depth would otherwise leave every game pixel as a square.
+        // Four bilinear taps on a rotated grid give a soft, grid-free kernel.
+        "   if(uDof>0.5){"
+        "    vec4 w0=texture2D(uWorld,wuv);"
+        "    float blur=smoothstep(0.19,0.62,w0.a*(255.0/240.0));"
+        "    if(blur>0.001){"
+        "     vec2 o=uWorldTexel;"
+        "     vec3 b=(texture2D(uWorld,wuv+vec2(-1.5*o.x,-0.5*o.y)).rgb+texture2D(uWorld,wuv+vec2(1.5*o.x,0.5*o.y)).rgb+"
+        "             texture2D(uWorld,wuv+vec2(0.5*o.x,-1.5*o.y)).rgb+texture2D(uWorld,wuv+vec2(-0.5*o.x,1.5*o.y)).rgb)*0.25;"
+        "     col=mix(col,mix(w0.rgb,b,blur),min(1.0,blur*2.5));"
+        "    }"
+        "   }"
+        "  }"
+        "  if(uGlow>0.5) col+=texture2D(uBloom,wuv).rgb*1.5;"
+        "  if(uFlare>0.5){"
+        "   col+=lensFlare(wuv,uLight0,uTint0)+lensFlare(wuv,uLight1,uTint1);"
+        "  }"
+        " }"
+        " gl_FragColor=vec4(col,1.0); }";
+    gProgram = linkProgram(vs, fs);
     gPosLoc = glGetAttribLocation(gProgram, "aPos"); gUvLoc = glGetAttribLocation(gProgram, "aUv"); gTexLoc = glGetUniformLocation(gProgram, "uTex"); gScaleLoc = glGetUniformLocation(gProgram, "uScale"); gUvScaleLoc = glGetUniformLocation(gProgram, "uUvScale");
+    gWorldTexLoc = glGetUniformLocation(gProgram, "uWorld"); gWorldTexelLoc = glGetUniformLocation(gProgram, "uWorldTexel");
+    gWorldScaleYLoc = glGetUniformLocation(gProgram, "uWorldScaleY"); gSmoothLoc = glGetUniformLocation(gProgram, "uSmooth"); gDofLoc = glGetUniformLocation(gProgram, "uDof");
+    gBloomTexLoc = glGetUniformLocation(gProgram, "uBloom"); gGlowLoc = glGetUniformLocation(gProgram, "uGlow"); gFlareLoc = glGetUniformLocation(gProgram, "uFlare");
+    gFlareLight0Loc = glGetUniformLocation(gProgram, "uLight0"); gFlareLight1Loc = glGetUniformLocation(gProgram, "uLight1");
+    gFlareAspectLoc = glGetUniformLocation(gProgram, "uAspect");
+    gFlareTint0Loc = glGetUniformLocation(gProgram, "uTint0"); gFlareTint1Loc = glGetUniformLocation(gProgram, "uTint1");
+    const char* overlayFs = "precision mediump float; varying vec2 vUv; uniform sampler2D uTex; void main(){ gl_FragColor=texture2D(uTex,vUv); }";
+    gOverlayProgram = linkProgram(vs, overlayFs);
+    gOverlayPosLoc = glGetAttribLocation(gOverlayProgram, "aPos"); gOverlayUvLoc = glGetAttribLocation(gOverlayProgram, "aUv");
+    gOverlayTexLoc = glGetUniformLocation(gOverlayProgram, "uTex"); gOverlayScaleLoc = glGetUniformLocation(gOverlayProgram, "uScale");
     const GLfloat verts[] = { -1.f,-1.f,0.f,1.f, 1.f,-1.f,1.f,1.f, -1.f,1.f,0.f,0.f, 1.f,1.f,1.f,0.f };
     glGenBuffers(1, &gVbo); glBindBuffer(GL_ARRAY_BUFFER, gVbo); glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
     glGenTextures(1, &gTexture); glBindTexture(GL_TEXTURE_2D, gTexture);
@@ -3132,6 +3328,26 @@ static void ensureGl() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, FB_W, FB_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, &gFramebuffer[0]);
     gTextureWidth = FB_W;
     gTextureHeight = FB_H;
+    const unsigned int blackPixel = 0xff000000u;
+    glGenTextures(1, &gWorldTexture); glBindTexture(GL_TEXTURE_2D, gWorldTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &blackPixel);
+    gWorldTextureWidth = gWorldTextureHeight = 1;
+    gWorldFramebufferDirty = true;
+    const unsigned int clearPixel = 0x00000000u;
+    glGenTextures(1, &gBloomTexture); glBindTexture(GL_TEXTURE_2D, gBloomTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &clearPixel);
+    gBloomTextureWidth = gBloomTextureHeight = 1;
+    gBloomFramebufferDirty = true;
+    glGenTextures(1, &gOverlayTexture); glBindTexture(GL_TEXTURE_2D, gOverlayTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &blackPixel);
+    gOverlayTextureWidth = gOverlayTextureHeight = 1;
+    glBindTexture(GL_TEXTURE_2D, gTexture);
 }
 
 
@@ -4229,7 +4445,12 @@ static void playerFireWeapon() {
     const int shots = gPlayerWeapons[gPlayerWeapon] >= 2 ? 2 : 1;
     for (int shotIndex = 0; shotIndex < shots; ++shotIndex) {
         const float angle = gPlayerA + (shots == 2 ? (shotIndex == 0 ? -0.025f : 0.025f) : 0.0f);
-        const float muzzleZ = gPlayerBaseZF + weapon->param[11];
+        // param[11] placed the six shot sprites at very different heights
+        // (visual centres 30..49 with the eye at 54): weapon 1 and the flamer
+        // skimmed the floor, 5 and 6 hugged the sight. Give every shot the
+        // same visual centre height; damage, speed and aiming are unchanged.
+        const int shotSpriteHeight = !weapon->frames.empty() ? weapon->frames[0].height : weapon->spriteHeight;
+        const float muzzleZ = gPlayerBaseZF + PLAYER_SHOT_CENTER_HEIGHT - 0.5f * (float)std::max(1, shotSpriteHeight);
         // PlayerShot uses (LookHeightNum << 8) as obj_hheading. Projectile
         // movement then applies heading/32768 per original world unit. Since
         // one map cell is 64 world units, this is LookHeightNum/2 z-units per
@@ -5109,7 +5330,7 @@ static void updatePlayerMotion() {
     if ((gPlayerLookUnits <= -72.0f && gPlayerLookSpeed < 0.0f) ||
         (gPlayerLookUnits >= 72.0f && gPlayerLookSpeed > 0.0f)) gPlayerLookSpeed = 0.0f;
     const float projectedLookOffset = gPlayerLookUnits * 0.5f *
-        ((float)FB_H / ORIGINAL_VERTICAL_REFERENCE);
+        ((float)PROJECTION_H / ORIGINAL_VERTICAL_REFERENCE);
     const int roundedLookOffset = (int)(projectedLookOffset +
         (projectedLookOffset >= 0.0f ? 0.5f : -0.5f));
     gPlayerLookHorizonY = std::max(8, std::min(VIEW_H - 8,
@@ -5159,9 +5380,11 @@ static void updatePlayerMotion() {
         // OscillationAmp's speed-64 row maps the seven-pixel source wave to
         // five vertical pixels at normal walking speed.
         gPlayerBobOffset = (float)bobWave[(int)gPlayerBobPhase & 63] * (5.0f / 7.0f) * movementAmount;
+        gPlayerBobAmount = movementAmount;
     } else {
         gPlayerBobPhase = 0.0f;
         gPlayerBobOffset = 0.0f;
+        gPlayerBobAmount = 0.0f;
     }
     const float ca = cosf(gPlayerA), sa = sinf(gPlayerA);
     float moveForward = 0.0f, moveSide = 0.0f;
@@ -5671,7 +5894,9 @@ static void drawSkyBackground() {
     // v32 rotated the sky too slowly in open WLD1 areas, especially around BLES0008/map8.
     // Keep this isolated from wall/floor texture binding so only sky pan behaviour changes.
     const int horizon = currentViewHorizonY();
-    const int lookOffset = horizon - VIEW_CENTER_Y;
+    // Anchor the panorama at the horizon with its original 80-line scale. A
+    // taller view therefore shows more of the upper sky instead of stretching.
+    const int lookOffset = horizon - BASE_VIEW_CENTER_Y;
     const TextureBitmap* activeSky = currentLevelSkyTexture();
     if (!activeSky || !activeSky->ok) activeSky = &gSkyTex;
     const int pixelSizeX = std::max(1, std::min(2, gRenderPixelSizeX));
@@ -5685,7 +5910,7 @@ static void drawSkyBackground() {
             const float sx = (float)centeredX * (float)activeSky->width / (float)BASE_FB_W +
                              gPlayerA * SKY_SCROLL_SCALE_V33;
             const int sourceY = y + (pixelSizeY - 1) / 2 - lookOffset;
-            int sy = (int)((sourceY * (int)activeSky->height * SKY_VERTICAL_SCALE_V33) / VIEW_CENTER_Y);
+            int sy = (int)((sourceY * (int)activeSky->height * SKY_VERTICAL_SCALE_V33) / BASE_VIEW_CENTER_Y);
             if (sy < 0) sy = 0;
             if (sy >= (int)activeSky->height) sy = (int)activeSky->height - 1;
             // The source panoramas are clean. Fractional horizontal sampling
@@ -5696,7 +5921,7 @@ static void drawSkyBackground() {
                 for (int px = x; px < std::min(FB_W, x + pixelSizeX); ++px)
                     gFramebuffer[py * FB_W + px] = color;
         } else {
-            int v = 72 + (std::max(0, y - lookOffset) * 64) / VIEW_CENTER_Y;
+            int v = 72 + (std::max(0, y - lookOffset) * 64) / BASE_VIEW_CENTER_Y;
             if (v > 136) v = 136;
             const unsigned int color = 0xff000000u | ((unsigned)v << 16) |
                 ((unsigned)(v / 2) << 8) | (unsigned)(v / 3);
@@ -5870,7 +6095,7 @@ static int projectColumnHeightYV64(int worldZ, float dist) {
     // v64: one original sector height span (normally 128 units) corresponds to the
     // same projected height as the old full wall. This anchors walls to sector
     // floor/ceil heights instead of screen-centering every wall slice.
-    const float scale = (float)FB_H / (ORIGINAL_VERTICAL_REFERENCE * dist);
+    const float scale = (float)PROJECTION_H / (ORIGINAL_VERTICAL_REFERENCE * dist);
     const float y = (float)FB_H * 0.5f - ((float)(worldZ - gPlayerEyeZ) * scale);
     return clampScreenY((int)floorf(y + 0.5f));
 }
@@ -6025,7 +6250,7 @@ static void __attribute__((unused)) drawRoomRendererLegacy() {
 
 static int projectWorldYPortal(int worldZ, float distance) {
     if (distance < 0.025f) distance = 0.025f;
-    const float projection = (float)FB_H / ORIGINAL_VERTICAL_REFERENCE;
+    const float projection = (float)PROJECTION_H / ORIGINAL_VERTICAL_REFERENCE;
     const float y = (float)currentViewHorizonY() - ((float)(worldZ - gPlayerEyeZ) * projection / distance);
     return (int)floorf(y + 0.5f);
 }
@@ -6041,7 +6266,7 @@ static int blockLightAt(const LgldBlockInfo& block, float distance, int side) {
 
 static void drawPortalPlaneSegment(int x, int y0, int y1, float rayX, float rayY,
                                    float nearDistance, float farDistance, const LgldBlockInfo& block,
-                                   bool floorPlane, bool filled[FB_H]) {
+                                   bool floorPlane, bool* filled) {
     if (y0 > y1) return;
     const int texIndex = floorPlane ? block.floorTex : block.ceilTex;
     if (!floorPlane && texIndex < 0) return; // panoramic sky was drawn as the background
@@ -6049,7 +6274,7 @@ static void drawPortalPlaneSegment(int x, int y0, int y1, float rayX, float rayY
     if ((!texture || !texture->ok) && gFloorTexCount > 0) texture = &gFloorTex[0];
     if (!texture || !texture->ok) return;
     const int planeZ = floorPlane ? block.floorHeight : block.ceilHeight;
-    const float projection = (float)FB_H / ORIGINAL_VERTICAL_REFERENCE;
+    const float projection = (float)PROJECTION_H / ORIGINAL_VERTICAL_REFERENCE;
     y0 = std::max(0, y0);
     y1 = std::min(VIEW_H - 1, y1);
     const int pixelSize = std::max(1, std::min(2, gRenderPixelSizeY));
@@ -6116,7 +6341,7 @@ static PortalWallVerticalMapping portalWallVerticalMapping(int firstHeight, int 
 }
 
 static int portalWallTextureY(float distance, int screenY, int anchorWorld, bool unpegged, int textureHeight) {
-    const float projection = (float)FB_H / ORIGINAL_VERTICAL_REFERENCE;
+    const float projection = (float)PROJECTION_H / ORIGINAL_VERTICAL_REFERENCE;
     const float worldAtY = (float)gPlayerEyeZ + ((float)currentViewHorizonY() - (float)screenY) * distance / projection;
     int texY = (int)floorf((float)anchorWorld - worldAtY);
     if (unpegged) texY += textureHeight - 1;
@@ -6125,7 +6350,7 @@ static int portalWallTextureY(float distance, int screenY, int anchorWorld, bool
 
 static void drawPortalWallSegment(int x, int y0, int y1, float distance, int brushOffset,
                                   const TextureBitmap* texture, const LgldBlockInfo& lightBlock,
-                                  int side, bool filled[FB_H], int anchorWorld, bool unpegged) {
+                                  int side, bool* filled, int anchorWorld, bool unpegged) {
     if (!texture || !texture->ok || y0 > y1) return;
     y0 = std::max(0, y0);
     y1 = std::min(VIEW_H - 1, y1);
@@ -6152,7 +6377,7 @@ static void drawPortalWallSegment(int x, int y0, int y1, float distance, int bru
 
 static void sealPortalWallGaps(int x, int y0, int y1, float distance, int brushOffset,
                               const TextureBitmap* texture, const LgldBlockInfo& lightBlock,
-                              int side, bool filled[FB_H], int anchorWorld) {
+                              int side, bool* filled, int anchorWorld) {
     if (!texture || !texture->ok) return;
     y0 = std::max(0, y0);
     y1 = std::min(VIEW_H - 1, y1);
@@ -6177,7 +6402,7 @@ static void sealPortalWallGaps(int x, int y0, int y1, float distance, int brushO
 }
 
 static unsigned int darkenBlobShadowPixel(unsigned int color, float strength) {
-    strength = std::max(0.0f, std::min(0.45f, strength));
+    strength = std::max(0.0f, std::min(0.52f, strength));
     const float multiplier = 1.0f - strength;
     const unsigned int red = (unsigned int)((float)(color & 0xffu) * multiplier + 0.5f);
     const unsigned int green = (unsigned int)((float)((color >> 8) & 0xffu) * multiplier + 0.5f);
@@ -6219,11 +6444,11 @@ static void drawPlacedObjectBlobShadow(const RuntimeObject& runtime,
     const float heightStrength = pickup
         ? 0.88f - bobPosition * 0.12f
         : std::max(0.68f, 1.0f - hoverHeight / 150.0f);
-    const float baseStrength = (pickup ? 0.30f : 0.34f) * heightStrength;
+    const float baseStrength = (pickup ? 0.36f : 0.41f) * heightStrength;
 
     const int screenX = (int)((float)FB_W * 0.5f * (1.0f + lateral / depth));
     const int groundY = projectWorldYPortal(objectBlock.floorHeight, depth);
-    const float projection = (float)FB_H / ORIGINAL_VERTICAL_REFERENCE;
+    const float projection = (float)PROJECTION_H / ORIGINAL_VERTICAL_REFERENCE;
     const int screenRadius = std::max(2, (int)ceilf(radiusCells * 64.0f * projection /
         std::max(0.05f, depth)) + 2);
     const int minX = std::max(0, screenX - screenRadius);
@@ -6340,7 +6565,7 @@ static void drawPlacedObjectBillboards() {
         int bottom = projectWorldYPortal(block->floorHeight + objectYOffset + bob, visible[i].depth);
         if (top > bottom) std::swap(top, bottom);
         const int spriteWorldWidth = haveSprite ? spriteWidth : (definition ? definition->radius * 2 : 32);
-        const int halfWidth = std::max(1, (int)((float)spriteWorldWidth * 0.5f * ((float)FB_H / ORIGINAL_VERTICAL_REFERENCE) / visible[i].depth));
+        const int halfWidth = std::max(1, (int)((float)spriteWorldWidth * 0.5f * ((float)PROJECTION_H / ORIGINAL_VERTICAL_REFERENCE) / visible[i].depth));
         const unsigned int hash = fnv1aUpdate(2166136261u, (const unsigned char*)object.name.data(), object.name.size());
         const unsigned int color = 0xff000000u | (((hash >> 16) & 0x7fu) + 96u) << 16 |
                                    (((hash >> 8) & 0x7fu) + 64u) << 8 | ((hash & 0x7fu) + 96u);
@@ -6364,6 +6589,37 @@ static void drawPlacedObjectBillboards() {
     }
 }
 
+static void playerWeaponPlacementLocked(int& left, int& top) {
+    // Walking sway follows the original bob waveform: a gentle sideways swing
+    // per step cycle plus a small dip on every footfall. Looking up lowers the
+    // weapon behind the HUD, looking down raises it.
+    const float angle = gPlayerBobPhase * (6.28318531f / 64.0f);
+    const float amount = std::max(0.0f, std::min(1.0f, gPlayerBobAmount));
+    const int swayX = (int)floorf(sinf(angle) * 3.0f * amount + 0.5f);
+    const int swayY = (int)floorf(fabsf(sinf(angle)) * 2.0f * amount + 0.5f);
+    const float look = std::max(-1.0f, std::min(1.0f,
+        (float)(gPlayerLookHorizonY - VIEW_CENTER_Y) / WEAPON_LOOK_RANGE_PX));
+    const int lookShift = (int)floorf(look * (look < 0.0f ? WEAPON_LOOK_RAISE_MAX : WEAPON_LOOK_LOWER_MAX) + 0.5f);
+    // 1:1 framebuffer pixels: the sprite already uses the game's pixel grid.
+    left = (FB_W - gWeaponBody.width) / 2 + swayX;
+    top = VIEW_H - 1 - gWeaponBody.contentBottom + WEAPON_BASE_DROP + swayY + lookShift;
+}
+
+static bool playerWeaponMuzzle(float& muzzleX, float& muzzleY) {
+    std::lock_guard<std::mutex> lock(gWeaponSpriteMutex);
+    if (!gWeaponBody.ok || gPlayerDead) return false;
+    int left = 0, top = 0;
+    playerWeaponPlacementLocked(left, top);
+    if (gWeaponOrb.ok) {
+        muzzleX = (float)(left + (gWeaponBody.width - gWeaponOrb.width) / 2) + gWeaponOrb.anchorX;
+        muzzleY = (float)(top + (gWeaponBody.height - gWeaponOrb.height) / 2) + gWeaponOrb.anchorY;
+    } else {
+        muzzleX = (float)left + (float)gWeaponBody.width * 0.5f;
+        muzzleY = (float)top + (float)gWeaponBody.height * 0.37f;
+    }
+    return true;
+}
+
 static void drawRuntimeProjectiles() {
     if (gRuntimeProjectiles.empty()) return;
     const float dirX = cosf(gPlayerA), dirY = sinf(gPlayerA);
@@ -6381,6 +6637,8 @@ static void drawRuntimeProjectiles() {
         if (depth > 0.03f && fabsf(lateral / depth) < 1.4f) visible.push_back(ProjectedShot{&projectile, depth, lateral});
     }
     std::sort(visible.begin(), visible.end(), [](const ProjectedShot& a, const ProjectedShot& b) { return a.depth > b.depth; });
+    float muzzleX = 0.0f, muzzleY = 0.0f;
+    const bool haveMuzzle = playerWeaponMuzzle(muzzleX, muzzleY);
     for (size_t i = 0; i < visible.size(); ++i) {
         const RuntimeProjectile& projectile = *visible[i].projectile;
         const GlobalObjectInfo& definition = *projectile.definition;
@@ -6393,11 +6651,30 @@ static void drawRuntimeProjectiles() {
         if (spriteWidth <= 0 || spriteHeight <= 0 || !pixels || pixels->empty()) continue;
         const LgldBlockInfo* block = currentLgldBlockForCell((int)floorf(projectile.x), (int)floorf(projectile.y));
         if (!block) continue;
-        const int screenX = (int)((float)FB_W * 0.5f * (1.0f + visible[i].lateral / visible[i].depth));
+        int screenX = (int)((float)FB_W * 0.5f * (1.0f + visible[i].lateral / visible[i].depth));
         int top = projectWorldYPortal((int)projectile.z + spriteHeight, visible[i].depth);
         int bottom = projectWorldYPortal((int)projectile.z, visible[i].depth);
         if (top > bottom) std::swap(top, bottom);
-        const int halfWidth = std::max(1, (int)((float)spriteWidth * 0.5f * ((float)FB_H / ORIGINAL_VERTICAL_REFERENCE) / visible[i].depth));
+        int halfWidth = std::max(1, (int)((float)spriteWidth * 0.5f * ((float)PROJECTION_H / ORIGINAL_VERTICAL_REFERENCE) / visible[i].depth));
+        if (!projectile.enemy && haveMuzzle && projectile.travelled < PLAYER_SHOT_LAUNCH_DISTANCE) {
+            // Display-only launch: a fresh shot starts small at the muzzle and
+            // blends into its true projected flight path. Physically it is
+            // still below the weapon, which would show it under the HUD.
+            const float t = std::max(0.0f, projectile.travelled / PLAYER_SHOT_LAUNCH_DISTANCE);
+            const float blend = t * t * (3.0f - 2.0f * t);
+            const float startHalfWidth = 3.0f;
+            const float startHalfHeight = startHalfWidth * (float)spriteHeight / (float)std::max(1, spriteWidth);
+            const float trueCenterY = 0.5f * (float)(top + bottom);
+            const float trueHalfHeight = 0.5f * (float)(bottom - top);
+            const float centerX = muzzleX + ((float)screenX - muzzleX) * blend;
+            const float centerY = std::min(muzzleY, muzzleY + (trueCenterY - muzzleY) * blend);
+            const float halfW = startHalfWidth + ((float)halfWidth - startHalfWidth) * blend;
+            const float halfH = startHalfHeight + (trueHalfHeight - startHalfHeight) * blend;
+            screenX = (int)floorf(centerX + 0.5f);
+            halfWidth = std::max(1, (int)floorf(halfW + 0.5f));
+            top = (int)floorf(centerY - halfH + 0.5f);
+            bottom = std::max(top, (int)floorf(centerY + halfH + 0.5f));
+        }
         for (int y = std::max(0, top); y <= std::min(VIEW_H - 1, bottom); ++y) for (int x = std::max(0, screenX - halfWidth); x <= std::min(FB_W - 1, screenX + halfWidth); ++x) {
             const size_t destination = (size_t)y * FB_W + (size_t)x;
             if (visible[i].depth >= gWallDepth[destination]) continue;
@@ -6444,7 +6721,7 @@ static void drawRuntimeImpactExplosions() {
         int bottom = projectWorldYPortal((int)floorf(effect.z - (float)frame.height * 0.5f), visible[i].depth);
         if (top > bottom) std::swap(top, bottom);
         const int halfWidth = std::max(1, (int)((float)frame.width * 0.5f *
-            ((float)FB_H / ORIGINAL_VERTICAL_REFERENCE) / visible[i].depth));
+            ((float)PROJECTION_H / ORIGINAL_VERTICAL_REFERENCE) / visible[i].depth));
         for (int y = std::max(0, top); y <= std::min(VIEW_H - 1, bottom); ++y) {
             for (int x = std::max(0, screenX - halfWidth); x <= std::min(FB_W - 1, screenX + halfWidth); ++x) {
                 const size_t destination = (size_t)y * FB_W + (size_t)x;
@@ -6565,7 +6842,7 @@ static void drawRoomRenderer() {
     std::vector<OrigVtHit> hits;
     hits.reserve(32);
     for (int x = 0; x < FB_W; x += pixelSize) {
-        bool filled[FB_H] = {false};
+        bool filled[MAX_FB_H] = {false};
         const float sampleX = (float)x + (float)(pixelSize - 1) * 0.5f;
         const float cameraX = 2.0f * sampleX / (float)FB_W - 1.0f;
         const float rayX = dirX + planeX * cameraX;
@@ -6735,6 +7012,7 @@ static void drawIngameMap() {
     const int visibleColumns = 80;
     const int visibleRows = 50;
     const int mapLeft = (FB_W - visibleColumns * scale) / 2;
+    const int mapTop = std::max(0, (FB_H - visibleRows * scale) / 2);
     const int firstMapX = std::max(0, std::min(48, (int)floorf(gMapOriginX + 0.5f)));
     const int firstMapY = std::max(0, std::min(78, (int)floorf(gMapOriginY + 0.5f)));
     const unsigned int blockColor = paletteColor(243);
@@ -6745,7 +7023,7 @@ static void drawIngameMap() {
         const int mx = firstMapX + sx;
         const int my = firstMapY + sy;
         if (automapCellSeen(mx, my) && currentLgldCellRaw(mx, my) > 0)
-            fillRectSafe(mapLeft + sx * scale, sy * scale, scale, scale, blockColor);
+            fillRectSafe(mapLeft + sx * scale, mapTop + sy * scale, scale, scale, blockColor);
     }
 
     for (int sy = 0; sy < visibleRows; ++sy) for (int sx = 0; sx < visibleColumns; ++sx) {
@@ -6753,7 +7031,7 @@ static void drawIngameMap() {
         const int my = firstMapY + sy;
         if (!automapCellSeen(mx, my)) continue;
         const int px = mapLeft + sx * scale;
-        const int py = sy * scale;
+        const int py = mapTop + sy * scale;
         const int leftColor = originalMapBoundaryColor(mx, my, mx - 1, my);
         const int upperColor = originalMapBoundaryColor(mx, my, mx, my - 1);
         if (leftColor != 0) drawLineSafe(px, py, px, py + scale - 1, paletteColor((unsigned char)leftColor));
@@ -6782,7 +7060,7 @@ static void drawIngameMap() {
     if (playerScreenX >= 0 && playerScreenX < visibleColumns &&
         playerScreenY >= 0 && playerScreenY < visibleRows) {
         const int px = mapLeft + playerScreenX * scale;
-        const int py = playerScreenY * scale;
+        const int py = mapTop + playerScreenY * scale;
         const unsigned int playerColor = paletteColor((unsigned char)(((int)(now * 6.25) & 1) ? 243 : 41));
         for (int row = 0; row < 3; ++row) for (int column = 0; column < 3; ++column) {
             if ((playerMasks[direction][row] & (1u << (2 - column))) != 0u)
@@ -6973,6 +7251,8 @@ static void setFrontendState(FrontendState state) {
         std::lock_guard<std::mutex> lock(gGameSnapshotMutex);
         gPauseBackground = gHaveGameSnapshot ? gLastGameFramebuffer : gFramebuffer;
         gPauseBackgroundRefreshRequested.store(false);
+        gPauseOptionsOpen = false;
+        gPauseOptionsSelection = 0;
     }
     if (state != FRONTEND_PAUSE) gPauseBackgroundRefreshRequested.store(false);
     gFrontendState = state;
@@ -7079,7 +7359,6 @@ static void selectRuntimeTerminalItem() {
 
 static void drawFrontendMenu() {
     drawPresentationPicture("BTIT");
-    drawPresentationTextCentered(74, "CONFIGURATION MENU");
     static const char* entries[] = {"START GAME", "SOUND", "CONTROLS", "GAME OPTIONS", "CREDITS", "QUIT GAME"};
     for (int i = 0; i < 6; ++i) {
         const int y = 98 + i * 14;
@@ -7165,6 +7444,211 @@ static void drawGameOptionsMenu() {
     }
 }
 
+static void detectFlareLights(const std::vector<float>& bloom, int width, int height, float normalize) {
+    // Pick the two brightest separated spots of the blurred bright-pass and
+    // refine each to its brightness-weighted centroid.
+    std::vector<float> lum((size_t)width * (size_t)height);
+    for (size_t i = 0; i < lum.size(); ++i)
+        lum[i] = (bloom[i * 3u] * 0.299f + bloom[i * 3u + 1u] * 0.587f + bloom[i * 3u + 2u] * 0.114f) * normalize / 255.0f;
+    FlareLight found[FLARE_LIGHTS];
+    const int suppress = std::max(4, width / 8);
+    for (int slot = 0; slot < FLARE_LIGHTS; ++slot) {
+        int best = -1;
+        float bestValue = 0.10f;
+        for (int i = 0; i < (int)lum.size(); ++i) if (lum[(size_t)i] > bestValue) { bestValue = lum[(size_t)i]; best = i; }
+        if (best < 0) break;
+        const int bx = best % width, by = best / width;
+        double sx = 0.0, sy = 0.0, sw = 0.0;
+        for (int y = std::max(0, by - suppress); y <= std::min(height - 1, by + suppress); ++y)
+            for (int x = std::max(0, bx - suppress); x <= std::min(width - 1, bx + suppress); ++x) {
+                float& v = lum[(size_t)y * (size_t)width + (size_t)x];
+                if (v > bestValue * 0.5f) { sx += (double)v * ((double)x + 0.5); sy += (double)v * ((double)y + 0.5); sw += v; }
+                v = 0.0f;
+            }
+        if (sw <= 0.0) break;
+        found[slot].x = (float)(sx / sw) / (float)width;
+        found[slot].y = (float)(sy / sw) / (float)height;
+        // The light's colour, normalised and mixed 45 % towards white (CubeEvil4).
+        const float* c = &bloom[(size_t)best * 3u];
+        const float peak = std::max(1.0f, std::max(c[0], std::max(c[1], c[2])));
+        found[slot].r = c[0] / peak + (1.0f - c[0] / peak) * 0.45f;
+        found[slot].g = c[1] / peak + (1.0f - c[1] / peak) * 0.45f;
+        found[slot].b = c[2] / peak + (1.0f - c[2] / peak) * 0.45f;
+        found[slot].intensity = std::max(0.0f, std::min(1.0f, (bestValue - 0.10f) / 0.45f));
+    }
+    // Keep each slot attached to the nearest previous light; a light that
+    // appears far away fades in from zero instead of making the ghosts jump.
+    for (int slot = 0; slot < FLARE_LIGHTS; ++slot) {
+        FlareLight& current = gFlareLights[slot];
+        const FlareLight& target = found[slot];
+        const float dx = target.x - current.x, dy = target.y - current.y;
+        if (target.intensity <= 0.0f) {
+            current.intensity *= 0.86f;
+        } else if (current.intensity < 0.02f || dx * dx + dy * dy > 0.02f) {
+            if (current.intensity > 0.02f) current.intensity *= 0.55f; // lost: gone in a few pictures
+            else {
+                current.x = target.x; current.y = target.y;
+                current.r = target.r; current.g = target.g; current.b = target.b;
+                current.intensity += (target.intensity - current.intensity) * 0.1f;
+            }
+        } else {
+            current.x += dx * 0.5f;
+            current.y += dy * 0.5f;
+            current.r += (target.r - current.r) * 0.12f;
+            current.g += (target.g - current.g) * 0.12f;
+            current.b += (target.b - current.b) * 0.12f;
+            current.intensity += (target.intensity - current.intensity) *
+                (target.intensity > current.intensity ? 0.1f : 0.14f);
+        }
+    }
+}
+
+static void buildBloomLayer() {
+    // Bright-pass at quarter resolution followed by two separable box blurs.
+    const int width = (FB_W + BLOOM_DOWNSAMPLE - 1) / BLOOM_DOWNSAMPLE;
+    const int height = (VIEW_H + BLOOM_DOWNSAMPLE - 1) / BLOOM_DOWNSAMPLE;
+    std::vector<float> acc((size_t)width * (size_t)height * 3u, 0.0f);
+    const unsigned int threshold = 170u;
+    for (int y = 0; y < VIEW_H; ++y) {
+        const size_t row = (size_t)(y / BLOOM_DOWNSAMPLE) * (size_t)width;
+        for (int x = 0; x < FB_W; ++x) {
+            const unsigned int c = gWorldFramebuffer[(size_t)y * (size_t)FB_W + (size_t)x];
+            const unsigned int r = c & 0xffu, g = (c >> 8) & 0xffu, b = (c >> 16) & 0xffu;
+            const unsigned int lum = (r * 77u + g * 150u + b * 29u) >> 8;
+            if (lum <= threshold) continue;
+            const float weight = (float)(lum - threshold) / (float)(255u - threshold);
+            float* cell = &acc[(row + (size_t)(x / BLOOM_DOWNSAMPLE)) * 3u];
+            cell[0] += (float)r * weight; cell[1] += (float)g * weight; cell[2] += (float)b * weight;
+        }
+    }
+    std::vector<float> tmp(acc.size(), 0.0f);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) for (int k = 0; k < 3; ++k) {
+            float sum = 0.0f;
+            for (int d = -1; d <= 1; ++d) {
+                const int sx = std::max(0, std::min(width - 1, x + d));
+                sum += acc[((size_t)y * (size_t)width + (size_t)sx) * 3u + (size_t)k];
+            }
+            tmp[((size_t)y * (size_t)width + (size_t)x) * 3u + (size_t)k] = sum / 3.0f;
+        }
+        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) for (int k = 0; k < 3; ++k) {
+            float sum = 0.0f;
+            for (int d = -1; d <= 1; ++d) {
+                const int sy = std::max(0, std::min(height - 1, y + d));
+                sum += tmp[((size_t)sy * (size_t)width + (size_t)x) * 3u + (size_t)k];
+            }
+            acc[((size_t)y * (size_t)width + (size_t)x) * 3u + (size_t)k] = sum / 3.0f;
+        }
+    }
+    const float normalize = 1.0f / (float)(BLOOM_DOWNSAMPLE * BLOOM_DOWNSAMPLE);
+    gBloomFramebuffer.resize((size_t)width * (size_t)height);
+    for (size_t i = 0; i < gBloomFramebuffer.size(); ++i) {
+        const unsigned int r = (unsigned int)std::min(255.0f, acc[i * 3u] * normalize);
+        const unsigned int g = (unsigned int)std::min(255.0f, acc[i * 3u + 1u] * normalize);
+        const unsigned int b = (unsigned int)std::min(255.0f, acc[i * 3u + 2u] * normalize);
+        gBloomFramebuffer[i] = 0xff000000u | (b << 16) | (g << 8) | r;
+    }
+    gBloomWidth = width;
+    gBloomHeight = height;
+    gBloomFramebufferDirty = true;
+    if (gLensFlareEnabled) detectFlareLights(acc, width, height, normalize);
+}
+
+static void captureWorldLayer() {
+    gFlareFade = 1.0f;
+    // Called once the 3-D view (including the teleport fade) is complete and
+    // before any HUD, weapon or text overlay is drawn.
+    const size_t count = (size_t)FB_W * (size_t)VIEW_H;
+    if (gFramebuffer.size() < count || gWallDepth.size() < count) return;
+    const float scale = 240.0f / WORLD_DEPTH_RANGE;
+    for (size_t i = 0; i < count; ++i) {
+        const float depth = gWallDepth[i];
+        unsigned int code = 240u;
+        if (depth < WORLD_DEPTH_RANGE) code = (unsigned int)std::max(0.0f, depth * scale);
+        gFramebuffer[i] = (gFramebuffer[i] & 0x00ffffffu) | (code << 24);
+    }
+    gWorldFramebuffer.assign(gFramebuffer.begin(), gFramebuffer.begin() + (std::ptrdiff_t)count);
+    gWorldFramebufferDirty = true;
+    if (gGlowEnabled || gLensFlareEnabled) buildBloomLayer();
+}
+
+static bool playerWeaponReady() {
+    // Display-only mirror of playerFireWeapon()'s preconditions: the orb glows
+    // while the selected ammunition can actually be fired.
+    if (gPlayerWeapon < 0 || gPlayerWeapon >= PLAYER_WEAPON_COUNT ||
+        gPlayerHealth <= 0 || !gPlayerWeapons[gPlayerWeapon]) return false;
+    if (gGodMode) return true;
+    const GlobalObjectInfo* weapon = currentWeaponDefinition();
+    const int energyCost = weapon ? std::max(0, weapon->param[2]) : 1;
+    return gPlayerEnergy >= energyCost;
+}
+
+static void blitWeaponSprite(const WeaponSprite& sprite, int left, int top, int brightness = 256) {
+    for (int y = 0; y < sprite.height; ++y) {
+        const int dy = top + y;
+        if (dy < 0) continue;
+        if (dy >= VIEW_H) break; // never paint over the HUD
+        for (int x = 0; x < sprite.width; ++x) {
+            const int dx = left + x;
+            if ((unsigned)dx >= (unsigned)FB_W) continue;
+            unsigned int src = sprite.pixels[(size_t)y * (size_t)sprite.width + (size_t)x];
+            const unsigned int alpha = src >> 24;
+            if (alpha != 0u && brightness < 256) {
+                const unsigned int r = ((src & 0xffu) * (unsigned int)brightness) >> 8;
+                const unsigned int g = (((src >> 8) & 0xffu) * (unsigned int)brightness) >> 8;
+                const unsigned int b = (((src >> 16) & 0xffu) * (unsigned int)brightness) >> 8;
+                src = (src & 0xff000000u) | (b << 16) | (g << 8) | r;
+            }
+            if (alpha == 0u) continue;
+            unsigned int& dst = gFramebuffer[(size_t)dy * (size_t)FB_W + (size_t)dx];
+            if (alpha == 255u) { dst = src; continue; }
+            unsigned int out = 0xff000000u;
+            for (int shift = 0; shift < 24; shift += 8) {
+                const unsigned int sc = (src >> shift) & 0xffu;
+                const unsigned int dc = (dst >> shift) & 0xffu;
+                out |= ((sc * alpha + dc * (255u - alpha) + 127u) / 255u) << shift;
+            }
+            dst = out;
+        }
+    }
+}
+
+static float gWeaponLight = 1.0f;
+static double gWeaponLightTime = 0.0;
+
+static float playerWeaponLightTarget() {
+    // Outdoors (sky ceiling) and in normally lit sectors the weapon keeps its
+    // full art brightness; only darker sectors (positive illumination in
+    // DrawScreen.asm terms) dim it, down to 45 % in the darkest rooms.
+    const LgldBlockInfo* block = currentLgldBlockForCell((int)floorf(gPlayerX), (int)floorf(gPlayerY));
+    if (!block || block->ceilTex < 0) return 1.0f;
+    const int light = blockLightAt(*block, 0.0f, 0);
+    return 0.45f + 0.55f * std::max(0.0f, std::min(1.0f, (float)(light - 64) / 192.0f));
+}
+
+static void drawPlayerWeapon() {
+    if (gPlayerDead) return;
+    const double now = nowSeconds();
+    const float dt = gWeaponLightTime > 0.0 ? (float)std::min(0.25, now - gWeaponLightTime) : 1.0f;
+    gWeaponLightTime = now;
+    // Ease towards the sector's light so crossing a cell border never pops.
+    gWeaponLight += (playerWeaponLightTarget() - gWeaponLight) * std::min(1.0f, dt * 5.0f);
+    const int brightness = std::max(0, std::min(256, (int)(gWeaponLight * 256.0f + 0.5f)));
+    std::lock_guard<std::mutex> lock(gWeaponSpriteMutex);
+    if (!gWeaponBody.ok) return;
+    int left = 0, top = 0;
+    playerWeaponPlacementLocked(left, top);
+    blitWeaponSprite(gWeaponBody, left, top, brightness);
+    if (gWeaponOrb.ok && playerWeaponReady()) {
+        // The orb glows by itself and keeps its full brightness.
+        // The orb takes the colour of the selected ammunition.
+        const int tint = std::max(0, std::min(WEAPON_ORB_TINTS - 1, gPlayerWeapon));
+        const WeaponSprite& orb = gWeaponOrbTinted[tint].ok ? gWeaponOrbTinted[tint] : gWeaponOrb;
+        blitWeaponSprite(orb, left + (gWeaponBody.width - orb.width) / 2,
+                         top + (gWeaponBody.height - orb.height) / 2);
+    }
+}
+
 static void refreshPausedGameFrame() {
     if (gFrontendState == FRONTEND_PAUSE && currentLgldAsset()) {
         // Called only by the render thread. Input callbacks merely request this
@@ -7177,6 +7661,8 @@ static void refreshPausedGameFrame() {
         gMoveLastTime = now;
         gObjectLastTime = now;
         drawRoomRenderer();
+        captureWorldLayer();
+        drawPlayerWeapon();
         drawOriginalHud();
         gPauseBackground = gFramebuffer;
         gAnalogLX = savedLX; gAnalogLY = savedLY;
@@ -7206,22 +7692,164 @@ static void toggleBlobShadows() {
     gPauseBackgroundRefreshRequested.store(true);
 }
 
+static void toggleSmoothing() {
+    gSmoothingEnabled = !gSmoothingEnabled;
+    playSoundResource("SWT1");
+    saveControlBindings();
+}
+
+static void toggleDepthOfField() {
+    gDepthOfFieldEnabled = !gDepthOfFieldEnabled;
+    playSoundResource("SWT1");
+    saveControlBindings();
+}
+
+static void toggleGlow() {
+    gGlowEnabled = !gGlowEnabled;
+    playSoundResource("SWT1");
+    saveControlBindings();
+    gPauseBackgroundRefreshRequested.store(true);
+}
+
+static void toggleLensFlare() {
+    gLensFlareEnabled = !gLensFlareEnabled;
+    playSoundResource("SWT1");
+    saveControlBindings();
+    gPauseBackgroundRefreshRequested.store(true);
+}
+
+static int pauseMenuEntryCount() {
+    return gPauseOptionsOpen ? PAUSE_OPTION_ENTRIES : PAUSE_MAIN_ENTRIES;
+}
+
+static int& pauseMenuSelection() {
+    return gPauseOptionsOpen ? gPauseOptionsSelection : gPauseMenuSelection;
+}
+
+static int pauseMenuEntryY(int index) {
+    int y = PAUSE_FIRST_ENTRY_Y + index * PAUSE_ENTRY_SPACING;
+    if (!gPauseOptionsOpen && index >= 3) y += PAUSE_GROUP_GAP; // QUIT TO TITLE
+    return y;
+}
+
+static void movePauseMenuSelection(int delta) {
+    const int count = pauseMenuEntryCount();
+    int& selection = pauseMenuSelection();
+    selection = ((selection + delta) % count + count) % count;
+}
+
+static void adjustPauseOption() {
+    if (!gPauseOptionsOpen) return;
+    switch (gPauseOptionsSelection) {
+        case 1: toggleRenderPixelSize(); break;
+        case 2: toggleBlobShadows(); break;
+        case 3: toggleSmoothing(); break;
+        case 4: toggleDepthOfField(); break;
+        case 5: toggleGlow(); break;
+        case 6: toggleLensFlare(); break;
+        default: break;
+    }
+}
+
+static void backPauseMenu() {
+    if (gPauseOptionsOpen) {
+        gPauseOptionsOpen = false;
+        gPauseMenuSelection = 1;
+    } else {
+        setFrontendState(FRONTEND_GAME);
+    }
+}
+
+static void confirmPauseMenu() {
+    if (gPauseOptionsOpen) {
+        if (gPauseOptionsSelection == 0) backPauseMenu();
+        else adjustPauseOption();
+        return;
+    }
+    if (gPauseMenuSelection == 0) {
+        setFrontendState(FRONTEND_GAME);
+    } else if (gPauseMenuSelection == 1) {
+        gPauseOptionsOpen = true;
+        gPauseOptionsSelection = 0;
+    } else if (gPauseMenuSelection == 2) {
+        gRestoreLevelCheckpoint = true;
+        gRuntimeAssetIndex = -99999;
+        gPlayerStartChecked = false;
+        setFrontendState(FRONTEND_GAME);
+    } else {
+        saveGameProgress();
+        setFrontendState(FRONTEND_TITLE);
+    }
+}
+
+static void beginMenuOverlay() {
+    // Several in-game texts share the transparent 240-line overlay per frame.
+    if (gMenuOverlayVisible) return;
+    gMenuOverlay.assign((size_t)gMenuOverlayW * (size_t)MENU_OVERLAY_H, 0u);
+    gMenuOverlayVisible = true;
+}
+
+static void putOverlayPixel(int x, int y, unsigned int color) {
+    if ((unsigned)x >= (unsigned)gMenuOverlayW || (unsigned)y >= (unsigned)MENU_OVERLAY_H) return;
+    gMenuOverlay[(size_t)y * (size_t)gMenuOverlayW + (size_t)x] = color;
+}
+
+static void fillOverlayRect(int x, int y, int w, int h, unsigned int color) {
+    for (int py = y; py < y + h; ++py) for (int px = x; px < x + w; ++px) putOverlayPixel(px, py, color);
+}
+
+static void drawOverlayTextCentered(int y, const char* text) {
+    int px = (gMenuOverlayW - textWidth(text)) / 2;
+    while (*text) {
+        if (*text == ' ') px += 4;
+        else {
+            const unsigned char* glyph = glyph5x7(*text);
+            for (int row = 0; row < 7; ++row) for (int col = 0; col < 5; ++col)
+                if (glyph[row] & (1 << (4 - col))) putOverlayPixel(px + col, y + row, 0xffffffffu);
+            px += 6;
+        }
+        ++text;
+    }
+}
+
 static void drawPauseMenu() {
     if (gPauseBackgroundRefreshRequested.exchange(false)) refreshPausedGameFrame();
     if (gPauseBackground.size() == gFramebuffer.size()) gFramebuffer = gPauseBackground;
-    drawTextCentered(51, "GAME MENU");
-    char renderSize[32];
-    snprintf(renderSize, sizeof(renderSize), "RENDER SIZE  %dx%d",
-             gRenderPixelSizeX, gRenderPixelSizeY);
-    char blobShadows[32];
-    snprintf(blobShadows, sizeof(blobShadows), "BLOBSHADOWS  %s",
-             gBlobShadowsEnabled ? "YES" : "NO");
-    const char* entries[] = {"RESUME", renderSize, blobShadows, "RESTART LEVEL", "QUIT TO TITLE"};
-    for (int i = 0; i < 5; ++i) {
-        const int y = 71 + i * 14;
-        if (i == gPauseMenuSelection) fillRectSafe((FB_W - 136) / 2, y - 4, 136, 15, 0xff604020u);
-        drawTextCentered(y, entries[i]);
+    beginMenuOverlay();
+    char pixelSize[32], blobShadows[32], smoothing[32], depthOfField[32], glow[32], lensFlare[32];
+    const char* title = "GAME MENU";
+    const char* entries[PAUSE_OPTION_ENTRIES] = {"RESUME", "OPTIONS", "RESTART LEVEL", "QUIT TO TITLE", "", "", ""};
+    if (gPauseOptionsOpen) {
+        title = "OPTIONS";
+        snprintf(pixelSize, sizeof(pixelSize), "PIXEL SIZE  %dX%d", gRenderPixelSizeX, gRenderPixelSizeY);
+        snprintf(blobShadows, sizeof(blobShadows), "BLOBSHADOWS  %s", gBlobShadowsEnabled ? "ON" : "OFF");
+        snprintf(smoothing, sizeof(smoothing), "SMOOTHING  %s", gSmoothingEnabled ? "ON" : "OFF");
+        snprintf(depthOfField, sizeof(depthOfField), "DEPTH OF FIELD  %s", gDepthOfFieldEnabled ? "ON" : "OFF");
+        entries[0] = "BACK";
+        entries[1] = pixelSize;
+        entries[2] = blobShadows;
+        entries[3] = smoothing;
+        entries[4] = depthOfField;
+        snprintf(glow, sizeof(glow), "GLOW  %s", gGlowEnabled ? "ON" : "OFF");
+        snprintf(lensFlare, sizeof(lensFlare), "LENS FLARE  %s", gLensFlareEnabled ? "ON" : "OFF");
+        entries[5] = glow;
+        entries[6] = lensFlare;
     }
+    drawOverlayTextCentered(PAUSE_TITLE_Y, title);
+    const int count = pauseMenuEntryCount();
+    const int selection = pauseMenuSelection();
+    for (int i = 0; i < count; ++i) {
+        const int y = pauseMenuEntryY(i);
+        if (i == selection) fillOverlayRect((gMenuOverlayW - 176) / 2, y - 4, 176, 16, 0xff604020u);
+        drawOverlayTextCentered(y, entries[i]);
+    }
+}
+
+static void drawPickupMessageOverlay(const char* text) {
+    // Just above the HUD, in the same text size as the menus.
+    beginMenuOverlay();
+    const int viewBottom = VIEW_H * MENU_OVERLAY_H / std::max(1, FB_H);
+    drawOverlayTextCentered(viewBottom - 17, text);
 }
 
 static void drawOriginalHud() {
@@ -7229,11 +7857,11 @@ static void drawOriginalHud() {
         for (int y = 0; y < 40; ++y) {
             const unsigned int left = paletteColor(gHudPanelPixels[(size_t)y * 320u]);
             const unsigned int right = paletteColor(gHudPanelPixels[(size_t)y * 320u + 319u]);
-            for (int x = 0; x < HUD_X; ++x) gFramebuffer[(size_t)(160 + y) * FB_W + (size_t)x] = left;
+            for (int x = 0; x < HUD_X; ++x) gFramebuffer[(size_t)(VIEW_H + y) * FB_W + (size_t)x] = left;
             for (int x = 0; x < 320; ++x)
-                gFramebuffer[(size_t)(160 + y) * FB_W + (size_t)(HUD_X + x)] =
+                gFramebuffer[(size_t)(VIEW_H + y) * FB_W + (size_t)(HUD_X + x)] =
                     paletteColor(gHudPanelPixels[(size_t)y * 320u + (size_t)x]);
-            for (int x = HUD_X + 320; x < FB_W; ++x) gFramebuffer[(size_t)(160 + y) * FB_W + (size_t)x] = right;
+            for (int x = HUD_X + 320; x < FB_W; ++x) gFramebuffer[(size_t)(VIEW_H + y) * FB_W + (size_t)x] = right;
         }
         // Exact WeaponLightData/TurnLight masks from Scores.asm. The original
         // panel paints every owned weapon yellow and the currently selected
@@ -7254,7 +7882,7 @@ static void drawOriginalHud() {
                                                      (weapon == gPlayerWeapon ? 62 : 195));
             for (int row = 0; row < 6; ++row) for (int bit = 0; bit < 8; ++bit) {
                 if (weaponMasks[weapon][row] & (1u << (7 - bit)))
-                    putPixelSafe(HUD_X + baseX + bit, 160 + baseY + row, color);
+                    putPixelSafe(HUD_X + baseX + bit, VIEW_H + baseY + row, color);
             }
         }
         // Scores.asm KeyLightData: four 8x6 lamps in the lower-left HUD,
@@ -7267,7 +7895,7 @@ static void drawOriginalHud() {
             const unsigned int color = paletteColor(gPlayerKeys[key] ? keyColor[key] : 21);
             for (int row = 0; row < 6; ++row)
                 for (int column = 0; column < 8; ++column)
-                    putPixelSafe(HUD_X + keyX[key] + column, 160 + keyY[key] + row, color);
+                    putPixelSafe(HUD_X + keyX[key] + column, VIEW_H + keyY[key] + row, color);
         }
         // Original Scores.asm/PanelRefresh coordinates and original digit fonts.
         drawOriginalHudNumber(46, 20, std::min(9999999, gPlayerScore), 7, true);
@@ -7292,8 +7920,10 @@ static void drawRuntimeTerminal() {
     const unsigned int hover = 0xff604020u;
     const int selection = gRuntimeTerminalSelection;
     char line[64];
+    // Drawn in the 240-line overlay like the title and in-game menus.
+    beginMenuOverlay();
     snprintf(line, sizeof(line), "CONNECTED TO TERMINAL %d", gRuntimeTerminalNumber);
-    drawTextCentered(17, line);
+    drawOverlayTextCentered(20, line);
 
     const char* title = "MAIN PAGE";
     const char* const* entries = nullptr;
@@ -7317,7 +7947,7 @@ static void drawRuntimeTerminal() {
     else if (gRuntimeTerminalPage == 2) { title = "WEAPONS BOOST"; entries = boostEntries; count = 7; }
     else { title = "ACCESSORIES"; entries = accessoryEntries; count = 8; }
 
-    drawTextCentered(30, title);
+    drawOverlayTextCentered(36, title);
     // Fixed top-origin layout. Seven rows fit without touching the fixed
     // credits line; longer pages follow the selection and scroll vertically.
     const int visibleRows = 7;
@@ -7325,12 +7955,12 @@ static void drawRuntimeTerminal() {
                                           selection - visibleRows + 1));
     const int end = std::min(count, first + visibleRows);
     for (int i = first; i < end; ++i) {
-        const int y = 43 + (i - first) * 12;
-        if (selection == i) fillRectSafe((FB_W - 166) / 2, y - 3, 166, 11, hover);
-        drawTextCentered(y, entries[i]);
+        const int y = 56 + (i - first) * 14;
+        if (selection == i) fillOverlayRect((gMenuOverlayW - 176) / 2, y - 4, 176, 16, hover);
+        drawOverlayTextCentered(y, entries[i]);
     }
     snprintf(line, sizeof(line), "CREDITS  %05d", std::max(0, std::min(99999, gPlayerCredits)));
-    drawTextCentered(143, line);
+    drawOverlayTextCentered(162, line);
 }
 
 static void updateAndDrawFrontend() {
@@ -7382,16 +8012,23 @@ static void updateAndDrawFrontend() {
     }
 }
 
-static void applyOriginalRedHitPalette() {
-    if (nowSeconds() >= gRedFlashUntil) return;
-    for (size_t i = 0; i < gFramebuffer.size(); ++i) {
-        const unsigned int pixel = gFramebuffer[i];
+static void applyRedHitPaletteTo(std::vector<unsigned int>& pixels) {
+    for (size_t i = 0; i < pixels.size(); ++i) {
+        const unsigned int pixel = pixels[i];
         const unsigned int r = pixel & 0xffu;
         const unsigned int g = (pixel >> 8) & 0xffu;
         const unsigned int b = (pixel >> 16) & 0xffu;
         const unsigned int intensity = std::min(255u, (r * 77u + g * 150u + b * 29u) >> 8);
-        gFramebuffer[i] = 0xff000000u | intensity;
+        pixels[i] = (pixel & 0xff000000u) | intensity;
     }
+}
+
+static void applyOriginalRedHitPalette() {
+    if (nowSeconds() >= gRedFlashUntil) return;
+    // Alpha bytes carry the world/overlay marker and must survive the effect.
+    applyRedHitPaletteTo(gFramebuffer);
+    applyRedHitPaletteTo(gWorldFramebuffer);
+    applyRedHitPaletteTo(gBloomFramebuffer);
 }
 
 static void applyTeleportWhiteFade() {
@@ -7420,17 +8057,24 @@ static void applyTeleportWhiteFade() {
     }
 }
 
+static void applyBrightnessTo(std::vector<unsigned int>& pixels, float brightness) {
+    for (size_t i = 0; i < pixels.size(); ++i) {
+        const unsigned int pixel = pixels[i];
+        const unsigned int r = (unsigned int)((float)(pixel & 0xffu) * brightness);
+        const unsigned int g = (unsigned int)((float)((pixel >> 8) & 0xffu) * brightness);
+        const unsigned int b = (unsigned int)((float)((pixel >> 16) & 0xffu) * brightness);
+        pixels[i] = (pixel & 0xff000000u) | (b << 16) | (g << 8) | r;
+    }
+}
+
 static void applyEndLevelFade() {
     if (!gLevelExitActive) return;
     const float elapsed = (float)(nowSeconds() - gLevelExitStarted);
     const float brightness = std::max(0.0f, 1.0f - elapsed / 0.90f);
-    for (size_t i = 0; i < gFramebuffer.size(); ++i) {
-        const unsigned int pixel = gFramebuffer[i];
-        const unsigned int r = (unsigned int)((float)(pixel & 0xffu) * brightness);
-        const unsigned int g = (unsigned int)((float)((pixel >> 8) & 0xffu) * brightness);
-        const unsigned int b = (unsigned int)((float)((pixel >> 16) & 0xffu) * brightness);
-        gFramebuffer[i] = 0xff000000u | (b << 16) | (g << 8) | r;
-    }
+    applyBrightnessTo(gFramebuffer, brightness);
+    applyBrightnessTo(gWorldFramebuffer, brightness);
+    applyBrightnessTo(gBloomFramebuffer, brightness);
+    gFlareFade = brightness;
 }
 
 static bool completeEndLevelFade() {
@@ -7450,6 +8094,7 @@ static bool completeEndLevelFade() {
 }
 
 static void drawFrame() {
+    gMenuOverlayVisible = false;
     if (completeEndLevelFade()) {
         updateAndDrawFrontend();
     } else if (gFrontendState != FRONTEND_GAME) {
@@ -7457,8 +8102,10 @@ static void drawFrame() {
     } else if (currentLgldAsset()) {
         drawRoomRenderer();
         applyTeleportWhiteFade();
+        captureWorldLayer();
+        drawPlayerWeapon();
         drawOriginalHud();
-        if (nowSeconds() < gPickupMessageUntil) drawTextCentered(146, gPickupMessage.c_str());
+        if (nowSeconds() < gPickupMessageUntil && !gLevelExitActive) drawPickupMessageOverlay(gPickupMessage.c_str());
         applyOriginalRedHitPalette();
         applyEndLevelFade();
         if (gFrontendState == FRONTEND_GAME) {
@@ -7631,17 +8278,41 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
     gTexLoc = -1;
     gScaleLoc = -1;
     gUvScaleLoc = -1;
+    gWorldTexLoc = gWorldTexelLoc = gWorldScaleYLoc = gSmoothLoc = gDofLoc = -1;
+    gBloomTexLoc = gGlowLoc = gFlareLoc = -1;
+    gFlareLight0Loc = gFlareLight1Loc = gFlareAspectLoc = -1;
+    gFlareTint0Loc = gFlareTint1Loc = -1;
+    gBloomTexture = 0;
+    gBloomTextureWidth = gBloomTextureHeight = 0;
+    gWorldTexture = 0;
+    gWorldTextureWidth = gWorldTextureHeight = 0;
+    gOverlayProgram = 0;
+    gOverlayTexture = 0;
+    gOverlayPosLoc = gOverlayUvLoc = gOverlayTexLoc = gOverlayScaleLoc = -1;
+    gOverlayTextureWidth = gOverlayTextureHeight = 0;
 }
 
 static void resizeGameFramebufferForView(int width, int height) {
     if (width <= 0 || height <= 0) return;
     const float screenAspect = (float)width / (float)height;
-    int wantedWidth = (int)floorf((float)FB_H * screenAspect + 0.5f);
+    // Wider than 16:9: keep 200 lines and add columns. Narrower (16:10, 4:3):
+    // keep the established 356-column horizontal field of view and add lines,
+    // so the whole display shows rendered scenery with square pixels.
+    int wantedWidth = (int)floorf((float)BASE_FB_H * screenAspect + 0.5f);
     wantedWidth = std::max(BASE_FB_W, std::min(MAX_FB_W, wantedWidth));
     if ((wantedWidth & 1) != 0) ++wantedWidth;
-    if (wantedWidth == FB_W) return;
+    int wantedHeight = (int)floorf((float)wantedWidth / screenAspect + 0.5f);
+    wantedHeight = std::max(BASE_FB_H, std::min(MAX_FB_H, wantedHeight));
+    // No lower clamp beyond the 176-pixel highlight bar: the overlay must keep the
+    // window aspect exactly (ChromeOS free-form windows) so mouse clicks map 1:1.
+    gMenuOverlayW = std::max(180, std::min(1200, (int)floorf((float)MENU_OVERLAY_H * screenAspect + 0.5f)));
+    if (wantedWidth == FB_W && wantedHeight == FB_H) return;
 
     FB_W = wantedWidth;
+    FB_H = wantedHeight;
+    VIEW_H = FB_H - HUD_H;
+    VIEW_CENTER_Y = VIEW_H / 2;
+    gPlayerLookHorizonY = std::max(8, std::min(VIEW_H - 8, gPlayerLookHorizonY));
     HUD_X = (FB_W - ORIGINAL_W) / 2;
     gFramebuffer.assign((size_t)FB_W * FB_H, 0xff000000u);
     gPauseBackground.assign((size_t)FB_W * FB_H, 0xff000000u);
@@ -7651,6 +8322,11 @@ static void resizeGameFramebufferForView(int width, int height) {
         gHaveGameSnapshot = false;
     }
     gWallDepth.assign((size_t)FB_W * FB_H, 1.0e30f);
+    gWorldFramebuffer.clear();
+    gWorldFramebufferDirty = true;
+    gBloomFramebuffer.clear();
+    gBloomWidth = gBloomHeight = 0;
+    gBloomFramebufferDirty = true;
     gRuntimeTerminalBackground.clear();
     gOrigSpans.clear();
     gTextureWidth = 0;
@@ -7689,6 +8365,51 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, textureWidth, textureHeight, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
     }
     glUniform1i(gTexLoc, 0);
+    const size_t worldPixels = (size_t)FB_W * (size_t)VIEW_H;
+    const bool postFx = !presentation && gFrontendState != FRONTEND_MAP &&
+                        (gSmoothingEnabled || gDepthOfFieldEnabled || gGlowEnabled || gLensFlareEnabled) &&
+                        gWorldFramebuffer.size() == worldPixels;
+    const bool bloomFx = postFx && (gGlowEnabled || gLensFlareEnabled) && gBloomWidth > 0 &&
+                         gBloomFramebuffer.size() == (size_t)gBloomWidth * (size_t)gBloomHeight;
+    if (bloomFx) {
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, gBloomTexture);
+        if (gBloomTextureWidth != gBloomWidth || gBloomTextureHeight != gBloomHeight) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, gBloomWidth, gBloomHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, &gBloomFramebuffer[0]);
+            gBloomTextureWidth = gBloomWidth;
+            gBloomTextureHeight = gBloomHeight;
+        } else if (gBloomFramebufferDirty) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gBloomWidth, gBloomHeight, GL_RGBA, GL_UNSIGNED_BYTE, &gBloomFramebuffer[0]);
+        }
+        gBloomFramebufferDirty = false;
+        glActiveTexture(GL_TEXTURE0);
+    }
+    if (postFx) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, gWorldTexture);
+        if (gWorldTextureWidth != FB_W || gWorldTextureHeight != VIEW_H) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, FB_W, VIEW_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, &gWorldFramebuffer[0]);
+            gWorldTextureWidth = FB_W;
+            gWorldTextureHeight = VIEW_H;
+        } else if (gWorldFramebufferDirty) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, FB_W, VIEW_H, GL_RGBA, GL_UNSIGNED_BYTE, &gWorldFramebuffer[0]);
+        }
+        gWorldFramebufferDirty = false;
+        glActiveTexture(GL_TEXTURE0);
+    }
+    glUniform1i(gWorldTexLoc, 1);
+    glUniform2f(gWorldTexelLoc, 1.0f / (float)FB_W, 1.0f / (float)std::max(1, VIEW_H));
+    glUniform1f(gWorldScaleYLoc, (float)FB_H / (float)std::max(1, VIEW_H));
+    glUniform1f(gSmoothLoc, postFx && gSmoothingEnabled ? 1.0f : 0.0f);
+    glUniform1f(gDofLoc, postFx && gDepthOfFieldEnabled ? 1.0f : 0.0f);
+    glUniform1i(gBloomTexLoc, 2);
+    glUniform1f(gGlowLoc, bloomFx && gGlowEnabled ? 1.0f : 0.0f);
+    glUniform1f(gFlareLoc, bloomFx && gLensFlareEnabled ? 1.0f : 0.0f);
+    glUniform4f(gFlareLight0Loc, gFlareLights[0].x, gFlareLights[0].y, gFlareLights[0].intensity * gFlareFade, 0.0f);
+    glUniform4f(gFlareLight1Loc, gFlareLights[1].x, gFlareLights[1].y, gFlareLights[1].intensity * gFlareFade, 0.0f);
+    glUniform1f(gFlareAspectLoc, (float)FB_W / (float)std::max(1, VIEW_H));
+    glUniform3f(gFlareTint0Loc, gFlareLights[0].r, gFlareLights[0].g, gFlareLights[0].b);
+    glUniform3f(gFlareTint1Loc, gFlareLights[1].r, gFlareLights[1].g, gFlareLights[1].b);
     float scaleX = 1.0f, scaleY = 1.0f;
     const float contentAspect = (float)textureWidth / (float)textureHeight;
     const float screenAspect = gViewH > 0 ? (float)gViewW / (float)gViewH : contentAspect;
@@ -7711,6 +8432,97 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_BreathlessRendere
     glVertexAttribPointer(gPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)0);
     glVertexAttribPointer(gUvLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)(2 * sizeof(GLfloat)));
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    if (!presentation && gFrontendState != FRONTEND_MAP && gMenuOverlayVisible && gOverlayProgram &&
+        gMenuOverlay.size() == (size_t)gMenuOverlayW * (size_t)MENU_OVERLAY_H) {
+        // The menu overlay always spans the full display with square pixels.
+        glUseProgram(gOverlayProgram);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, gOverlayTexture);
+        if (gOverlayTextureWidth != gMenuOverlayW || gOverlayTextureHeight != MENU_OVERLAY_H) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, gMenuOverlayW, MENU_OVERLAY_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, &gMenuOverlay[0]);
+            gOverlayTextureWidth = gMenuOverlayW;
+            gOverlayTextureHeight = MENU_OVERLAY_H;
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gMenuOverlayW, MENU_OVERLAY_H, GL_RGBA, GL_UNSIGNED_BYTE, &gMenuOverlay[0]);
+        }
+        glUniform1i(gOverlayTexLoc, 0);
+        glUniform2f(gOverlayScaleLoc, 1.0f, 1.0f);
+        glEnableVertexAttribArray(gOverlayPosLoc); glEnableVertexAttribArray(gOverlayUvLoc);
+        glVertexAttribPointer(gOverlayPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)0);
+        glVertexAttribPointer(gOverlayUvLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void*)(2 * sizeof(GLfloat)));
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisable(GL_BLEND);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeSetWeaponSprites(
+        JNIEnv* env, jclass, jintArray body, jint bodyWidth, jint bodyHeight,
+        jintArray orb, jint orbWidth, jint orbHeight) {
+    // Java delivers unpremultiplied 0xAARRGGBB; the framebuffer stores RGBA
+    // bytes (0xAABBGGRR as a little-endian word).
+    auto convert = [env](jintArray source, int width, int height, WeaponSprite& out) {
+        out = WeaponSprite();
+        if (!source || width <= 0 || height <= 0 || width > 1024 || height > 1024) return;
+        if (env->GetArrayLength(source) < width * height) return;
+        std::vector<jint> argb((size_t)width * (size_t)height);
+        env->GetIntArrayRegion(source, 0, width * height, &argb[0]);
+        out.width = width;
+        out.height = height;
+        out.pixels.resize(argb.size());
+        int bottom = -1;
+        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+            const unsigned int v = (unsigned int)argb[(size_t)y * (size_t)width + (size_t)x];
+            const unsigned int a = v >> 24, r = (v >> 16) & 0xffu, g = (v >> 8) & 0xffu, b = v & 0xffu;
+            out.pixels[(size_t)y * (size_t)width + (size_t)x] = (a << 24) | (b << 16) | (g << 8) | r;
+            if (a >= 128u) bottom = y;
+        }
+        out.contentBottom = bottom >= 0 ? bottom : height - 1;
+        double sumX = 0.0, sumY = 0.0, sumA = 0.0;
+        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
+            const double a = (double)(out.pixels[(size_t)y * (size_t)width + (size_t)x] >> 24);
+            sumX += a * ((double)x + 0.5); sumY += a * ((double)y + 0.5); sumA += a;
+        }
+        out.anchorX = sumA > 0.0 ? (float)(sumX / sumA) : (float)width * 0.5f;
+        out.anchorY = sumA > 0.0 ? (float)(sumY / sumA) : (float)height * 0.5f;
+        out.ok = true;
+    };
+    // Ammunition colours 1..6: grey, yellow, green, orange, blue, red.
+    static const unsigned char tintColors[WEAPON_ORB_TINTS][3] = {
+        {196, 202, 212}, {255, 214, 60}, {80, 236, 90},
+        {255, 140, 30}, {70, 140, 255}, {255, 58, 48}
+    };
+    auto tintOrb = [](const WeaponSprite& source, const unsigned char* color, WeaponSprite& out) {
+        out = source;
+        if (!source.ok) return;
+        for (size_t i = 0; i < out.pixels.size(); ++i) {
+            const unsigned int v = source.pixels[i];
+            const float r = (float)(v & 0xffu), g = (float)((v >> 8) & 0xffu), b = (float)((v >> 16) & 0xffu);
+            // Re-map the cyan source by luminance: dark rim -> tinted glow -> white core.
+            const float lum = (0.299f * r + 0.587f * g + 0.114f * b) / 255.0f;
+            unsigned int channel[3];
+            for (int k = 0; k < 3; ++k) {
+                const float target = (float)color[k];
+                const float value = lum <= 0.70f ? target * (lum / 0.70f)
+                                                 : target + (255.0f - target) * ((lum - 0.70f) / 0.30f);
+                channel[k] = (unsigned int)std::max(0.0f, std::min(255.0f, value + 0.5f));
+            }
+            out.pixels[i] = (v & 0xff000000u) | (channel[2] << 16) | (channel[1] << 8) | channel[0];
+        }
+    };
+    WeaponSprite newBody, newOrb;
+    convert(body, bodyWidth, bodyHeight, newBody);
+    convert(orb, orbWidth, orbHeight, newOrb);
+    WeaponSprite newTints[WEAPON_ORB_TINTS];
+    for (int i = 0; i < WEAPON_ORB_TINTS; ++i) tintOrb(newOrb, tintColors[i], newTints[i]);
+    std::lock_guard<std::mutex> lock(gWeaponSpriteMutex);
+    gWeaponBody = newBody;
+    gWeaponOrb = newOrb;
+    for (int i = 0; i < WEAPON_ORB_TINTS; ++i) gWeaponOrbTinted[i] = newTints[i];
+    LOGI("weapon sprites body=%dx%d orb=%dx%d", gWeaponBody.width, gWeaponBody.height,
+         gWeaponOrb.width, gWeaponOrb.height);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nativeKey(JNIEnv*, jclass, jint keyCode, jboolean pressed) {
@@ -7824,30 +8636,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
         return;
     }
     if (gFrontendState == FRONTEND_PAUSE) {
-        if (keyCode == 19) gPauseMenuSelection = (gPauseMenuSelection + 4) % 5;
-        else if (keyCode == 20) gPauseMenuSelection = (gPauseMenuSelection + 1) % 5;
-        else if ((keyCode == 21 || keyCode == 22) && gPauseMenuSelection == 1)
-            toggleRenderPixelSize();
-        else if ((keyCode == 21 || keyCode == 22) && gPauseMenuSelection == 2)
-            toggleBlobShadows();
-        else if (isBackKey(keyCode) || keyCode == 82 || keyCode == gMenuKey || keyCode == 110)
-            setFrontendState(FRONTEND_GAME);
-        else if (isConfirmKey(keyCode)) {
-            if (gPauseMenuSelection == 0) setFrontendState(FRONTEND_GAME);
-            else if (gPauseMenuSelection == 1) {
-                toggleRenderPixelSize();
-            } else if (gPauseMenuSelection == 2) {
-                toggleBlobShadows();
-            } else if (gPauseMenuSelection == 3) {
-                gRestoreLevelCheckpoint = true;
-                gRuntimeAssetIndex = -99999;
-                gPlayerStartChecked = false;
-                setFrontendState(FRONTEND_GAME);
-            } else {
-                saveGameProgress();
-                setFrontendState(FRONTEND_TITLE);
-            }
-        }
+        if (keyCode == 19) movePauseMenuSelection(-1);
+        else if (keyCode == 20) movePauseMenuSelection(1);
+        else if (keyCode == 21 || keyCode == 22) adjustPauseOption();
+        else if (isBackKey(keyCode)) backPauseMenu();          // one level up
+        else if (keyCode == 82 || keyCode == gMenuKey || keyCode == 110)
+            setFrontendState(FRONTEND_GAME);                     // START resumes
+        else if (isConfirmKey(keyCode)) confirmPauseMenu();
         return;
     }
     if (gFrontendState == FRONTEND_MAP) {
@@ -8113,8 +8908,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
             }
             if (soundSettingsChanged) saveControlBindings();
         } else if (gFrontendState == FRONTEND_PAUSE && hx != 0) {
-            if (gPauseMenuSelection == 1) toggleRenderPixelSize();
-            else if (gPauseMenuSelection == 2) toggleBlobShadows();
+            adjustPauseOption();
         }
         lastHatX = hx;
     }
@@ -8129,8 +8923,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
             if (hy > 0) gControlsMenuSelection = (gControlsMenuSelection + 1) % 7;
             else if (hy < 0) gControlsMenuSelection = (gControlsMenuSelection + 6) % 7;
         } else if (gFrontendState == FRONTEND_PAUSE) {
-            if (hy > 0) gPauseMenuSelection = (gPauseMenuSelection + 1) % 5;
-            else if (hy < 0) gPauseMenuSelection = (gPauseMenuSelection + 4) % 5;
+            if (hy > 0) movePauseMenuSelection(1);
+            else if (hy < 0) movePauseMenuSelection(-1);
         } else if (gFrontendState == FRONTEND_TERMINAL) {
             const int count = runtimeTerminalChoiceCount();
             if (hy > 0) gRuntimeTerminalSelection = (gRuntimeTerminalSelection + 1) % count;
@@ -8194,21 +8988,16 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
     } else if (gFrontendState == FRONTEND_SOUND || gFrontendState == FRONTEND_CONTROLS) {
         setFrontendState(FRONTEND_MENU);
     } else if (gFrontendState == FRONTEND_PAUSE) {
-        if (virtualY >= 64.0f && virtualY < 134.0f) {
-            gPauseMenuSelection = std::max(0, std::min(4, (int)((virtualY - 64.0f) / 14.0f)));
-            if (gPauseMenuSelection == 0) setFrontendState(FRONTEND_GAME);
-            else if (gPauseMenuSelection == 1) {
-                toggleRenderPixelSize();
-            } else if (gPauseMenuSelection == 2) {
-                toggleBlobShadows();
-            } else if (gPauseMenuSelection == 3) {
-                gRestoreLevelCheckpoint = true;
-                gRuntimeAssetIndex = -99999;
-                gPlayerStartChecked = false;
-                setFrontendState(FRONTEND_GAME);
-            } else {
-                saveGameProgress();
-                setFrontendState(FRONTEND_TITLE);
+        // The pause menu lives in the 240-line overlay, not in the game buffer.
+        float menuX = 0.0f, menuY = 0.0f;
+        mapTouchToRenderedContent(x, y, gMenuOverlayW, MENU_OVERLAY_H, menuX, menuY);
+        const int count = pauseMenuEntryCount();
+        for (int i = 0; i < count; ++i) {
+            const float rowTop = (float)(pauseMenuEntryY(i) - 4);
+            if (menuY >= rowTop && menuY < rowTop + (float)PAUSE_ENTRY_SPACING) {
+                pauseMenuSelection() = i;
+                confirmPauseMenu();
+                break;
             }
         }
     } else if (gFrontendState == FRONTEND_TERMINAL) {
