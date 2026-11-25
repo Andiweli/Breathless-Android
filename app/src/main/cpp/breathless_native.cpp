@@ -7809,6 +7809,9 @@ static void detectFlareLights(const std::vector<float>& bloom, int width, int he
 
 static void buildBloomLayer() {
     // Bright-pass at quarter resolution followed by two separable box blurs.
+    // Runs after the weapon and HUD are composed and takes only world pixels
+    // that are still visible (alpha < 0xff): a bright enemy shot hidden behind
+    // the weapon must neither glow through it nor count as a lens-flare light.
     const int width = (FB_W + BLOOM_DOWNSAMPLE - 1) / BLOOM_DOWNSAMPLE;
     const int height = (VIEW_H + BLOOM_DOWNSAMPLE - 1) / BLOOM_DOWNSAMPLE;
     std::vector<float> acc((size_t)width * (size_t)height * 3u, 0.0f);
@@ -7816,7 +7819,8 @@ static void buildBloomLayer() {
     for (int y = 0; y < VIEW_H; ++y) {
         const size_t row = (size_t)(y / BLOOM_DOWNSAMPLE) * (size_t)width;
         for (int x = 0; x < FB_W; ++x) {
-            const unsigned int c = gWorldFramebuffer[(size_t)y * (size_t)FB_W + (size_t)x];
+            const unsigned int c = gFramebuffer[(size_t)y * (size_t)FB_W + (size_t)x];
+            if ((c >> 24) == 0xffu) continue; // weapon, crosshair or other overlay
             const unsigned int r = c & 0xffu, g = (c >> 8) & 0xffu, b = (c >> 16) & 0xffu;
             const unsigned int lum = (r * 77u + g * 150u + b * 29u) >> 8;
             if (lum <= threshold) continue;
@@ -7873,7 +7877,6 @@ static void captureWorldLayer() {
     }
     gWorldFramebuffer.assign(gFramebuffer.begin(), gFramebuffer.begin() + (std::ptrdiff_t)count);
     gWorldFramebufferDirty = true;
-    if (gGlowEnabled || gLensFlareEnabled) buildBloomLayer();
 }
 
 static bool playerWeaponReady() {
@@ -7968,6 +7971,7 @@ static void refreshPausedGameFrame() {
         captureWorldLayer();
         drawPlayerWeapon();
         drawOriginalHud();
+        if (gGlowEnabled || gLensFlareEnabled) buildBloomLayer();
         gPauseBackground = gFramebuffer;
         gAnalogLX = savedLX; gAnalogLY = savedLY;
         gAnalogRX = savedRX; gAnalogRY = savedRY;
@@ -8423,6 +8427,7 @@ static void drawFrame() {
         captureWorldLayer();
         drawPlayerWeapon();
         drawOriginalHud();
+        if (gGlowEnabled || gLensFlareEnabled) buildBloomLayer();
         if (nowSeconds() < gPickupMessageUntil && !gLevelExitActive) drawPickupMessageOverlay(gPickupMessage.c_str());
         applyOriginalRedHitPalette();
         applyEndLevelFade();
