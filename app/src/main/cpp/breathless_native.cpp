@@ -144,13 +144,13 @@ static const int MENU_OVERLAY_H = PRESENTATION_H;
 static int gMenuOverlayW = 427;
 static std::vector<unsigned int> gMenuOverlay;
 static bool gMenuOverlayVisible = false;
-static const int PAUSE_TITLE_Y = 46;
-static const int PAUSE_FIRST_ENTRY_Y = 66;
+static const int PAUSE_TITLE_Y = 32;
+static const int PAUSE_FIRST_ENTRY_Y = 52;
 static const int PAUSE_ENTRY_SPACING = 14;
 // Extra gap above QUIT TO TITLE, matching the title-to-first-entry gap.
 static const int PAUSE_GROUP_GAP = (PAUSE_FIRST_ENTRY_Y - PAUSE_TITLE_Y) - PAUSE_ENTRY_SPACING;
 static const int PAUSE_MAIN_ENTRIES = 4;
-static const int PAUSE_OPTION_ENTRIES = 8;
+static const int PAUSE_OPTION_ENTRIES = 9;
 
 struct WeaponSprite {
     int width = 0;
@@ -500,6 +500,9 @@ static bool gMipmapEnabled = true;
 static bool gDepthOfFieldEnabled = false;
 static bool gGlowEnabled = false;
 static bool gLensFlareEnabled = false;
+// 0 = off, 1 = default (original Mirino01 sight), 2 = small red cross.
+enum { CROSSHAIR_OFF = 0, CROSSHAIR_DEFAULT = 1, CROSSHAIR_CROSS = 2, CROSSHAIR_MODES = 3 };
+static int gCrosshairMode = CROSSHAIR_DEFAULT;
 // Set by the Java launcher before game data/settings are loaded. This checks
 // the physical device identity, not the OUYA product flavor (which is also
 // used by modern handhelds such as Retroid).
@@ -2592,7 +2595,7 @@ static bool saveControlBindings() {
     std::vector<unsigned char> bytes;
     static const unsigned char magic[8] = {'B','L','C','T','R','L','0','1'};
     bytes.insert(bytes.end(), magic, magic + sizeof(magic));
-    appendSaveU32(bytes, 10u);
+    appendSaveU32(bytes, 11u);
     appendSaveU32(bytes, (unsigned int)gFireKey);
     appendSaveU32(bytes, (unsigned int)gActivateKey);
     appendSaveU32(bytes, (unsigned int)gWeaponKey);
@@ -2611,6 +2614,7 @@ static bool saveControlBindings() {
     appendSaveU32(bytes, gGlowEnabled ? 1u : 0u);
     appendSaveU32(bytes, gLensFlareEnabled ? 1u : 0u);
     appendSaveU32(bytes, gMipmapEnabled ? 1u : 0u);
+    appendSaveU32(bytes, (unsigned int)gCrosshairMode);
     appendSaveU32(bytes, fnv1aUpdate(2166136261u, &bytes[0], bytes.size()));
 
     const std::string temporaryPath = path + ".tmp";
@@ -2628,7 +2632,7 @@ static bool saveControlBindings() {
          gRenderPixelSizeX, gRenderPixelSizeY, gBlobShadowsEnabled ? "yes" : "no",
          gSoundVolume, gSoundEnabled.load() ? "on" : "off",
          gMusicVolume, gMusicEnabled ? "on" : "off");
-    gLoadedControlVersion = 10u;
+    gLoadedControlVersion = 11u;
     return true;
 }
 
@@ -2640,7 +2644,7 @@ static bool loadControlBindings() {
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
     const long length = ftell(file);
     if ((length != 36 && length != 40 && length != 44 && length != 48 &&
-         length != 52 && length != 68 && length != 76 && length != 84 && length != 88) ||
+         length != 52 && length != 68 && length != 76 && length != 84 && length != 88 && length != 92) ||
         fseek(file, 0, SEEK_SET) != 0) { fclose(file); return false; }
     std::vector<unsigned char> bytes((size_t)length);
     const bool read = fread(&bytes[0], 1, bytes.size(), file) == bytes.size();
@@ -2655,7 +2659,8 @@ static bool loadControlBindings() {
     const unsigned int version = readSaveU32(bytes, offset, ok);
     if (!ok || (version != 1u && version != 2u && version != 3u &&
                 version != 4u && version != 5u && version != 6u &&
-                version != 7u && version != 8u && version != 9u && version != 10u)) return false;
+                version != 7u && version != 8u && version != 9u && version != 10u &&
+                version != 11u)) return false;
     if ((version == 1u && length != 36) || (version == 2u && length != 40) ||
         (version == 3u && length != 44) ||
         ((version == 4u || version == 5u) && length != 48) ||
@@ -2663,7 +2668,8 @@ static bool loadControlBindings() {
         (version == 7u && length != 68) ||
         (version == 8u && length != 76) ||
         (version == 9u && length != 84) ||
-        (version == 10u && length != 88)) return false;
+        (version == 10u && length != 88) ||
+        (version == 11u && length != 92)) return false;
     const int bindings[5] = {
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
         (int)readSaveU32(bytes, offset, ok), (int)readSaveU32(bytes, offset, ok),
@@ -2738,6 +2744,12 @@ static bool loadControlBindings() {
         const unsigned int mipmapping = readSaveU32(bytes, offset, ok);
         if (!ok || mipmapping > 1u) return false;
         gMipmapEnabled = mipmapping != 0u;
+    }
+    gCrosshairMode = CROSSHAIR_DEFAULT;
+    if (version >= 11u) {
+        const unsigned int crosshair = readSaveU32(bytes, offset, ok);
+        if (!ok || crosshair >= (unsigned int)CROSSHAIR_MODES) return false;
+        gCrosshairMode = (int)crosshair;
     }
     LOGI("controller/video/audio settings loaded fire=%d activate=%d weapon=%d run=%d menu=%d map=%d render=%dx%d blobShadows=%s sound=%d/%s music=%d/%s version=%u",
          gFireKey, gActivateKey, gWeaponKey, gRunKey, gMenuKey, gMapKey,
@@ -8026,6 +8038,13 @@ static void toggleGlow() {
     gPauseBackgroundRefreshRequested.store(true);
 }
 
+static void cycleCrosshair() {
+    gCrosshairMode = (gCrosshairMode + 1) % CROSSHAIR_MODES;
+    playSoundResource("SWT1");
+    saveControlBindings();
+    gPauseBackgroundRefreshRequested.store(true);
+}
+
 static void toggleLensFlare() {
     gLensFlareEnabled = !gLensFlareEnabled;
     playSoundResource("SWT1");
@@ -8056,13 +8075,14 @@ static void movePauseMenuSelection(int delta) {
 static void adjustPauseOption() {
     if (!gPauseOptionsOpen) return;
     switch (gPauseOptionsSelection) {
-        case 1: toggleRenderPixelSize(); break;
-        case 2: toggleBlobShadows(); break;
-        case 3: toggleMipmapping(); break;
-        case 4: toggleSmoothing(); break;
-        case 5: toggleDepthOfField(); break;
-        case 6: toggleGlow(); break;
-        case 7: toggleLensFlare(); break;
+        case 1: cycleCrosshair(); break;
+        case 2: toggleRenderPixelSize(); break;
+        case 3: toggleBlobShadows(); break;
+        case 4: toggleMipmapping(); break;
+        case 5: toggleSmoothing(); break;
+        case 6: toggleDepthOfField(); break;
+        case 7: toggleGlow(); break;
+        case 8: toggleLensFlare(); break;
         default: break;
     }
 }
@@ -8132,9 +8152,9 @@ static void drawPauseMenu() {
     if (gPauseBackgroundRefreshRequested.exchange(false)) refreshPausedGameFrame();
     if (gPauseBackground.size() == gFramebuffer.size()) gFramebuffer = gPauseBackground;
     beginMenuOverlay();
-    char pixelSize[32], blobShadows[32], mipmapping[32], smoothing[32], depthOfField[32], glow[32], lensFlare[32];
+    char crosshair[32], pixelSize[32], blobShadows[32], mipmapping[32], smoothing[32], depthOfField[32], glow[32], lensFlare[32];
     const char* title = "GAME MENU";
-    const char* entries[PAUSE_OPTION_ENTRIES] = {"RESUME", "OPTIONS", "RESTART LEVEL", "QUIT TO TITLE", "", "", ""};
+    const char* entries[PAUSE_OPTION_ENTRIES] = {"RESUME", "OPTIONS", "RESTART LEVEL", "QUIT TO TITLE", "", "", "", "", ""};
     if (gPauseOptionsOpen) {
         title = "OPTIONS";
         snprintf(pixelSize, sizeof(pixelSize), "PIXEL SIZE  %dX%d", gRenderPixelSizeX, gRenderPixelSizeY);
@@ -8142,16 +8162,19 @@ static void drawPauseMenu() {
         snprintf(smoothing, sizeof(smoothing), "SMOOTHING  %s", gSmoothingEnabled ? "ON" : "OFF");
         snprintf(depthOfField, sizeof(depthOfField), "DEPTH OF FIELD  %s", gDepthOfFieldEnabled ? "ON" : "OFF");
         snprintf(mipmapping, sizeof(mipmapping), "MIPMAPPING  %s", gMipmapEnabled ? "ON" : "OFF");
+        static const char* crosshairNames[CROSSHAIR_MODES] = {"OFF", "DEFAULT", "CROSS"};
+        snprintf(crosshair, sizeof(crosshair), "CROSSHAIR  %s", crosshairNames[gCrosshairMode]);
         entries[0] = "BACK";
-        entries[1] = pixelSize;
-        entries[2] = blobShadows;
-        entries[3] = mipmapping;
-        entries[4] = smoothing;
-        entries[5] = depthOfField;
+        entries[1] = crosshair;
+        entries[2] = pixelSize;
+        entries[3] = blobShadows;
+        entries[4] = mipmapping;
+        entries[5] = smoothing;
+        entries[6] = depthOfField;
         snprintf(glow, sizeof(glow), "GLOW  %s", gGlowEnabled ? "ON" : "OFF");
         snprintf(lensFlare, sizeof(lensFlare), "LENS FLARE  %s", gLensFlareEnabled ? "ON" : "OFF");
-        entries[6] = glow;
-        entries[7] = lensFlare;
+        entries[7] = glow;
+        entries[8] = lensFlare;
     }
     drawOverlayTextCentered(PAUSE_TITLE_Y, title);
     const int count = pauseMenuEntryCount();
@@ -8228,9 +8251,18 @@ static void drawOriginalHud() {
         "##.......##", "#.........#", ".....#.....", ".....#.....", "...........",
         "..##.#.##..", "...........", ".....#.....", ".....#.....", "#.........#", "##.......##"
     };
-    const int sightX = FB_W / 2 - 5, sightY = VIEW_CENTER_Y - 5;
-    for (int y = 0; y < 11; ++y) for (int x = 0; x < 11; ++x)
-        if (sightMask[y][x] == '#') putPixelSafe(sightX + x, sightY + y, 0xff0000ffu);
+    if (gCrosshairMode == CROSSHAIR_DEFAULT) {
+        const int sightX = FB_W / 2 - 5, sightY = VIEW_CENTER_Y - 5;
+        for (int y = 0; y < 11; ++y) for (int x = 0; x < 11; ++x)
+            if (sightMask[y][x] == '#') putPixelSafe(sightX + x, sightY + y, 0xff0000ffu);
+    } else if (gCrosshairMode == CROSSHAIR_CROSS) {
+        // Small red plus on the same centre pixel as the original sight.
+        const int cx = FB_W / 2, cy = VIEW_CENTER_Y;
+        for (int d = -2; d <= 2; ++d) {
+            putPixelSafe(cx + d, cy, 0xff0000ffu);
+            if (d != 0) putPixelSafe(cx, cy + d, 0xff0000ffu);
+        }
+    }
 }
 
 static void drawRuntimeTerminal() {
