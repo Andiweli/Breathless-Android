@@ -7990,16 +7990,15 @@ static void refreshPausedGameFrame() {
     }
 }
 
-static void toggleRenderPixelSize() {
-    if (gRenderPixelSizeX == 1 && gRenderPixelSizeY == 1) {
-        gRenderPixelSizeX = 2; gRenderPixelSizeY = 1;
-    } else if (gRenderPixelSizeX == 2 && gRenderPixelSizeY == 1) {
-        gRenderPixelSizeX = 1; gRenderPixelSizeY = 2;
-    } else if (gRenderPixelSizeX == 1 && gRenderPixelSizeY == 2) {
-        gRenderPixelSizeX = 2; gRenderPixelSizeY = 2;
-    } else {
-        gRenderPixelSizeX = 1; gRenderPixelSizeY = 1;
-    }
+static void toggleRenderPixelSize(int direction) {
+    // 1x1 -> 2x1 -> 1x2 -> 2x2, forwards or backwards.
+    static const int sizes[4][2] = {{1, 1}, {2, 1}, {1, 2}, {2, 2}};
+    int current = 3;
+    for (int i = 0; i < 4; ++i)
+        if (gRenderPixelSizeX == sizes[i][0] && gRenderPixelSizeY == sizes[i][1]) { current = i; break; }
+    const int next = (current + (direction < 0 ? 3 : 1)) % 4;
+    gRenderPixelSizeX = sizes[next][0];
+    gRenderPixelSizeY = sizes[next][1];
     playSoundResource("SWT1");
     saveControlBindings();
     gPauseBackgroundRefreshRequested.store(true);
@@ -8038,8 +8037,8 @@ static void toggleGlow() {
     gPauseBackgroundRefreshRequested.store(true);
 }
 
-static void cycleCrosshair() {
-    gCrosshairMode = (gCrosshairMode + 1) % CROSSHAIR_MODES;
+static void cycleCrosshair(int direction) {
+    gCrosshairMode = (gCrosshairMode + (direction < 0 ? CROSSHAIR_MODES - 1 : 1)) % CROSSHAIR_MODES;
     playSoundResource("SWT1");
     saveControlBindings();
     gPauseBackgroundRefreshRequested.store(true);
@@ -8072,11 +8071,12 @@ static void movePauseMenuSelection(int delta) {
     selection = ((selection + delta) % count + count) % count;
 }
 
-static void adjustPauseOption() {
+// direction: -1 = previous value (left), +1 = next value (right or confirm).
+static void adjustPauseOption(int direction) {
     if (!gPauseOptionsOpen) return;
     switch (gPauseOptionsSelection) {
-        case 1: cycleCrosshair(); break;
-        case 2: toggleRenderPixelSize(); break;
+        case 1: cycleCrosshair(direction); break;
+        case 2: toggleRenderPixelSize(direction); break;
         case 3: toggleBlobShadows(); break;
         case 4: toggleMipmapping(); break;
         case 5: toggleSmoothing(); break;
@@ -8099,7 +8099,7 @@ static void backPauseMenu() {
 static void confirmPauseMenu() {
     if (gPauseOptionsOpen) {
         if (gPauseOptionsSelection == 0) backPauseMenu();
-        else adjustPauseOption();
+        else adjustPauseOption(1);
         return;
     }
     if (gPauseMenuSelection == 0) {
@@ -8996,7 +8996,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
     if (gFrontendState == FRONTEND_PAUSE) {
         if (keyCode == 19) movePauseMenuSelection(-1);
         else if (keyCode == 20) movePauseMenuSelection(1);
-        else if (keyCode == 21 || keyCode == 22) adjustPauseOption();
+        else if (keyCode == 21 || keyCode == 22) adjustPauseOption(keyCode == 21 ? -1 : 1);
         else if (isBackKey(keyCode)) backPauseMenu();          // one level up
         else if (keyCode == 82 || keyCode == gMenuKey || keyCode == 110)
             setFrontendState(FRONTEND_GAME);                     // START resumes
@@ -9266,7 +9266,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_ast_breathlessamiga_MainActivity_nati
             }
             if (soundSettingsChanged) saveControlBindings();
         } else if (gFrontendState == FRONTEND_PAUSE && hx != 0) {
-            adjustPauseOption();
+            adjustPauseOption(hx);
         }
         lastHatX = hx;
     }
