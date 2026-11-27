@@ -31,11 +31,12 @@ A short showreel can be [watched here](https://youtu.be/lxmx3KbsHKY).
 
 ## Screenshots
 
-<img width="1920" height="1080" alt="breathless0" src="https://github.com/user-attachments/assets/2a134053-cdbf-4128-9d35-09f366155270" />
-<img width="1920" height="1080" alt="breathless1" src="https://github.com/user-attachments/assets/532e5ad8-373f-437b-a693-107bf65bda9a" />
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/84fb6ce6-539f-4321-ad2e-76abe6e4ff7a" />
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/9d5eef38-abc6-44b8-9262-51ebbf40c384" />
-<img width="1920" height="1080" alt="breathless4" src="https://github.com/user-attachments/assets/132f797c-7823-4e1d-a6de-324d77ad7beb" />
+<img width="1920" height="1080" alt="1" src="https://github.com/user-attachments/assets/6f064410-4238-49ea-bd09-20932275a9d1" />
+<img width="1920" height="1080" alt="3" src="https://github.com/user-attachments/assets/12d73e79-a8af-4bd9-8456-2d66a72a37ba" />
+<img width="1920" height="1080" alt="4" src="https://github.com/user-attachments/assets/2c108c99-cf62-4c2b-8a80-5d75850566ac" />
+<img width="1920" height="1080" alt="6" src="https://github.com/user-attachments/assets/da7934b9-ca56-406a-bb5a-429ab7a171e1" />
+<img width="1920" height="1080" alt="7" src="https://github.com/user-attachments/assets/1eac9509-2058-42f7-b00b-1adfe5d31237" />
+<img width="1920" height="1080" alt="8" src="https://github.com/user-attachments/assets/5df0be53-653f-4225-837b-eb59e3c38b57" />
 
 ## Install Breathless on Android
 
