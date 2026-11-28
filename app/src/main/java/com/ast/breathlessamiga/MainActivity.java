@@ -29,7 +29,6 @@ import java.util.zip.ZipInputStream;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import com.ast.retrotouch.RetroTouchView;
-import com.ast.retrotouch.RetroTouchControllers;
 
 public class MainActivity extends Activity {
     private static final String TAG = "Breathless";
@@ -112,6 +111,7 @@ public class MainActivity extends Activity {
         loadWeaponSprites();
         chromeOsDevice = isChromeOsDevice();
         desktopInputActive = chromeOsDevice || hasHardwareKeyboard();
+        if (BuildConfig.DEBUG) Log.i(TAG, "Input devices:" + InputDevices.describeDevices());
 
         glView = new BreathlessView(this);
         glView.setCapturedPointerListener(new BreathlessView.CapturedPointerListener() {
@@ -319,17 +319,20 @@ public class MainActivity extends Activity {
             // Let Android change the media volume and display its normal overlay.
             return super.dispatchKeyEvent(event);
         }
+        // Fingerprint sensors and similar built-in pseudo devices send key
+        // events (navigation gestures). Leave them to Android; they must
+        // neither steer the game nor hide the touch controls.
+        if (InputDevices.isFromPseudoDevice(event)) return super.dispatchKeyEvent(event);
         int action = event.getAction();
         if (action == KeyEvent.ACTION_DOWN || action == KeyEvent.ACTION_UP) {
-            final boolean desktopKeyboard = isKeyboardSource(event.getSource()) &&
-                    !isControllerSource(event.getSource());
+            final boolean desktopKeyboard = InputDevices.isFromDesktopKeyboard(event);
             if (desktopKeyboard) {
                 desktopInputActive = true;
                 if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() > 0 &&
                         !isDesktopMovementKey(keyCode)) return true;
             }
             if (retroTouch != null && nativeTouchMode() != BreathlessTouchBridge.MODE_OFF &&
-                    isControllerSource(event.getSource()))
+                    InputDevices.isFromController(event))
                 retroTouch.notifyControllerInput();
             nativeKey(keyCode, action == KeyEvent.ACTION_DOWN);
             if (action == KeyEvent.ACTION_DOWN) {
@@ -349,9 +352,10 @@ public class MainActivity extends Activity {
             syncTouchOverlay();
             if (handled) return true;
         }
+        if (InputDevices.isFromPseudoDevice(event)) return super.dispatchGenericMotionEvent(event);
         if (event.getActionMasked() == MotionEvent.ACTION_MOVE) {
             if (retroTouch != null && nativeTouchMode() != BreathlessTouchBridge.MODE_OFF &&
-                    isControllerSource(event.getSource()))
+                    InputDevices.isFromController(event))
                 retroTouch.notifyControllerInput();
             float rawX = axis(event, MotionEvent.AXIS_X);
             float rawY = axis(event, MotionEvent.AXIS_Y);
@@ -494,7 +498,10 @@ public class MainActivity extends Activity {
     }
 
     private boolean hasHardwareKeyboard() {
-        return getResources().getConfiguration().keyboard != Configuration.KEYBOARD_NOKEYS;
+        // Configuration.keyboard alone is not enough: a fingerprint sensor that
+        // claims every key code makes Android report a QWERTY keyboard.
+        return getResources().getConfiguration().keyboard != Configuration.KEYBOARD_NOKEYS &&
+                InputDevices.isKeyboardConnected();
     }
 
     private boolean isChromeOsDevice() {
@@ -517,10 +524,6 @@ public class MainActivity extends Activity {
             if (event.getToolType(i) == MotionEvent.TOOL_TYPE_MOUSE) return true;
         }
         return false;
-    }
-
-    private static boolean isKeyboardSource(int source) {
-        return (source & InputDevice.SOURCE_KEYBOARD) == InputDevice.SOURCE_KEYBOARD;
     }
 
     private static boolean isDesktopMovementKey(int keyCode) {
@@ -567,7 +570,7 @@ public class MainActivity extends Activity {
             }
             if (retroTouch != null && retroTouch.getVisibility() != View.VISIBLE)
                 retroTouch.setVisibility(View.VISIBLE);
-            boolean controllerAvailable = RetroTouchControllers.isControllerConnected();
+            boolean controllerAvailable = InputDevices.isControllerConnected();
             final int nativeMode = nativeTouchMode();
             if (nativeMode != BreathlessTouchBridge.MODE_GAMEPLAY) {
                 releaseDesktopPointerCapture();
@@ -584,10 +587,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    private static boolean isControllerSource(int source) {
-        return (source & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
-                (source & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
-    }
 
     private static FrameLayout.LayoutParams matchParent() {
         return new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT,

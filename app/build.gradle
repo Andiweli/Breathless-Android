@@ -11,8 +11,8 @@ android {
 
     defaultConfig {
         applicationId 'com.ast.breathlessamiga'
-        versionCode 46
-        versionName '2.2'
+        versionCode 47
+        versionName '2.3'
 
         externalNativeBuild {
             cmake {
